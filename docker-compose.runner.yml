@@ -1,0 +1,89 @@
+# mandate-runner (Compose profile `runner`). Engineering-ready PRD PL-16, task B0-01.
+# Usage: make runner-up
+#
+# Two containers:
+#   mandate-runner        Polls Mandate's repos, posts mandate/build-verified. Holds the
+#                         runner App's key (read-only) and is the only thing that calls GitHub.
+#   mandate-runner-dind   The sandbox: its own Docker engine where PR code runs. No secrets
+#                         from ~/.mandate/secrets/build/ are ever mounted here.
+#
+# Joins the lab's existing lab_local network (dev-infra-lab); uses none of the lab's services.
+#
+# Test secrets for journeys (off by default; W0 turns them on):
+#   set MANDATE_RUNNER_TEST_SECRETS=1 in .env to add docker-compose.runner-test-secrets.yml.
+
+name: mandate-runner
+
+services:
+  mandate-runner-dind:
+    image: docker:29-dind@sha256:4bbc7223f81db790097c6dea42fb93e05b8fead4f0431fbe6ccaba6e8473201c
+    profiles: ["runner"]
+    container_name: lab-mandate-runner-dind
+    hostname: mandate-runner-dind
+    privileged: true
+    networks:
+      - lab_local
+    environment:
+      # TLS with generated certs: only holders of the client cert (the runner) can drive it.
+      DOCKER_TLS_CERTDIR: /certs
+    volumes:
+      - mandate_runner_dind_certs:/certs
+      - mandate_runner_dind_data:/var/lib/docker
+      - mandate_runner_work:/work
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    restart: unless-stopped
+
+  mandate-runner:
+    build:
+      context: services/mandate-runner
+      target: runtime
+    image: drivestream-lab/mandate-runner:local
+    profiles: ["runner"]
+    container_name: lab-mandate-runner
+    networks:
+      - lab_local
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      MANDATE_RUNNER_CONFIG: /etc/mandate-runner/runner.toml
+      MANDATE_RUNNER_SECRETS_DIR: /run/secrets/mandate-runner
+      MANDATE_RUNNER_TEST_SECRETS: "0"
+      DOCKER_HOST: tcp://mandate-runner-dind:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+    volumes:
+      # The runner App's key: read-only, this container only.
+      - ${HOME}/.mandate/secrets/build/mandate-runner:/run/secrets/mandate-runner:ro
+      - ./config/mandate-runner/runner.toml:/etc/mandate-runner/runner.toml:ro
+      - type: volume
+        source: mandate_runner_dind_certs
+        target: /certs/client
+        read_only: true
+        volume:
+          subpath: client
+      - mandate_runner_data:/var/lib/mandate-runner
+      - mandate_runner_work:/work
+    depends_on:
+      mandate-runner-dind:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  lab_local:
+    name: lab_local
+    external: true
+
+volumes:
+  mandate_runner_data:
+    name: mandate_runner_data
+  mandate_runner_work:
+    name: mandate_runner_work
+  mandate_runner_dind_data:
+    name: mandate_runner_dind_data
+  mandate_runner_dind_certs:
+    name: mandate_runner_dind_certs
