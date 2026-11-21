@@ -1,0 +1,110 @@
+# mandate-runner: grades PR heads on Mandate's repos and posts mandate/build-verified.
+# Engineering-ready PRD PL-16; implementation plan section 6, task B0-01.
+#
+# This file is the only source of the command set and the review rules.
+# Nothing in a pull request can change what the runner runs or checks.
+
+poll_interval_seconds = 30
+status_context = "mandate/build-verified"
+
+# Where run logs are served (read-only, bound to 127.0.0.1 on the host).
+log_base_url = "http://localhost:8090"
+
+# Inside the runner container (named volumes, see docker-compose.runner.yml).
+data_dir = "/var/lib/mandate-runner"
+# Shared with the sandbox so workspace paths are identical on both sides.
+work_dir = "/work"
+
+# Built inside the sandbox from services/mandate-runner/job-image and run by image id.
+job_image_tag = "drivestream-lab/mandate-runner-job:local"
+job_image_context = "/app/job-image"
+command_timeout_seconds = 3600
+
+[identities]
+runner_app_id = 5860839
+challenger_app_slug = "mandate-challenger"
+challenger_app_id = 5860827
+challenger_login = "mandate-challenger[bot]"
+human_signer_login = "nikd10x"
+
+# A challenger review counts for a slot only when its body carries exactly one of
+# these lines. Trust-critical paths need both, on separate reviews of the head.
+[markers]
+first = "Challenger: first"
+second = "Challenger: second"
+
+# A wave PR: develop into main, signed by the human signer.
+[wave]
+base_branch = "main"
+head_branch = "develop"
+label = "wave-accepted"
+initiative = "INIT-MANDATE-001"
+
+# One command set per base branch. PRs into any other base are not graded.
+# For now every graded PR runs the full journey set.
+[bases.develop]
+commands = ["make check", "make test", "make journeys"]
+
+[bases.main]
+commands = ["make check", "make test", "make journeys"]
+
+[[repos]]
+name = "drivestream-lab/mandate"
+# PL-16 BP-6. A PR touching any of these needs an Approve from the human signer.
+protected_paths = [
+  "CLAUDE.md",
+  ".claude/agents/**",
+  ".cursor/rules",
+  ".cursor/rules/**",
+  ".gitmodules",
+  "docs/specification/adr/**",
+  "docs/specification/product/**",
+  "tests/journeys/**",
+  "tests/verify/**",
+  "Makefile",
+  ".importlinter",
+  ".pre-commit-config.yaml",
+]
+# "Tool settings in pyproject.toml": any change to a [tool.*] table.
+pyproject_tool_settings_protected = true
+# The ledger, the signoff check, evidence verification and merge control.
+# A PR touching any of these needs a second, separate challenger Approve.
+trust_critical_paths = [
+  # ledger
+  "src/**/ledger/**",
+  "src/models/ledger_models.py",
+  "tests/**/*ledger*",
+  # signoff check
+  "src/business_services/gates/signoff*_service.py",
+  "src/business_services/gates/gate_decision_check_service.py",
+  "src/models/signoff_models.py",
+  # evidence verification
+  "src/infra_services/attestation_service.py",
+  "src/business_services/release/evidence_verification_service.py",
+  "src/models/evidence_models.py",
+  "tests/journeys/**/*evidence*",
+  # merge control
+  "src/business_services/release/merge_service.py",
+  "src/business_services/release/unguarded_merge_sweep_service.py",
+  "src/infra_services/github_app_service.py",
+  "tests/journeys/**/*merge*",
+]
+
+[[repos]]
+name = "drivestream-lab/mandate-control-tower"
+protected_paths = [
+  "CLAUDE.md",
+  ".claude/agents/**",
+  ".cursor/rules",
+  ".cursor/rules/**",
+  ".gitmodules",
+  "docs/specification/adr/**",
+  "docs/specification/product/**",
+  "tests/journeys/**",
+  "tests/verify/**",
+  "Makefile",
+  ".importlinter",
+  ".pre-commit-config.yaml",
+]
+pyproject_tool_settings_protected = true
+trust_critical_paths = []
