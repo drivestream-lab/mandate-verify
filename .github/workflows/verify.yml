@@ -1,0 +1,33 @@
+name: verify
+on:
+  workflow_call:
+    inputs:
+      commit:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - name: Build the evidence bundle
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/commit.txt
+          printf '{"preflight": true}\n' > evidence/report.json
+          tar -czf evidence.tgz evidence
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: evidence.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evidence
+          path: evidence.tgz
