@@ -7,8 +7,8 @@ started with the local override, which points it at drivestream-lab/mandate-sand
 only, with make setup, make check, make test, a develop run on a test branch, and a
 separate test signer:
 
-    make runner-up RUNNER_LOCAL=1
-    make verify-runner-live            # or: ARGS=--cleanup to sweep leftovers only
+    make deploy RUNNER_LOCAL=1
+    make verify                        # or: make verify ARGS=--cleanup to sweep leftovers only
 
 Who does what:
   - KD's gh (`gh` on this machine) pushes the test branches, adds the wave label and
@@ -245,6 +245,7 @@ class Run:
         *,
         base: str = "develop",
         draft: bool = False,
+        body: str = "",
     ) -> TestPR:
         pr = self.builder.call(
             "POST",
@@ -254,7 +255,8 @@ class Run:
                 "head": branch,
                 "base": base,
                 "draft": draft,
-                "body": "Opened by scripts/verify_runner_live.py (mandate-verify). Closed automatically; do not merge.",
+                "body": (body + "\n\n" if body else "")
+                + "Opened by scripts/verify_runner_live.py (mandate-verify). Closed automatically; do not merge.",
             },
         )
         if pr["head"]["sha"] != head:
@@ -264,9 +266,9 @@ class Run:
         say(f"opened #{test_pr.number} ({key}) by mandate-builder: https://github.com/{REPO}/pull/{test_pr.number}")
         return test_pr
 
-    def task_pr(self, key: str, title: str, files: dict[str, str | None]) -> TestPR:
+    def task_pr(self, key: str, title: str, files: dict[str, str | None], body: str = "") -> TestPR:
         branch, head = self.push_branch(key, files)
-        return self.open_pr(key, branch, head, title)
+        return self.open_pr(key, branch, head, title, body=body)
 
     def push(self, pr: TestPR, path: str, content: str) -> str:
         head = self.put_file(pr.branch, path, content)
@@ -576,8 +578,16 @@ def isolation_probe() -> str:
 
 DEVELOP_BRANCH = "chore/verify-runner-develop"  # the override's develop_run.branch
 FREEZE_LABEL = "develop-red"
-RED_JOURNEYS = "\njourneys:\n\t@echo 'verify-runner-live: a red journey'; exit 1\n"
-GREEN_JOURNEYS = "\njourneys:\n\t@echo 'verify-runner-live: every journey passed'\n"
+DEPLOYED = "lab-mandate-verify"  # the override's develop_run.deploy.container
+DEPLOYED_DB = "mandate_verify_lab"  # the override's develop_run.deploy.database
+# The test branch's `make verify`: sandbox-svc's one feature is its health endpoint, so its
+# journey is that the deployed service answers it. The red one is a journey that fails.
+RED_VERIFY = "\nverify:\n\t@echo 'verify-runner-live: a journey fails'; exit 1\n"
+GREEN_VERIFY = (
+    "\nverify:\n"
+    '\t@curl -fsS "$$MANDATE_SERVICE_URL/health" | grep -q \'"status":"ok"\'\n'
+    '\t@echo "verify-runner-live: $$MANDATE_SERVICE_URL/health answers ok"\n'
+)
 
 
 # --- scenarios --------------------------------------------------------------------------
@@ -596,13 +606,13 @@ def s1_runner_up(run: Run) -> str:
     if httpx.get(f"{LOG_SERVER}/healthz", timeout=10).text.strip() != "ok":
         raise Fail("log server does not answer")
     config = subprocess.run(
-        ["docker", "exec", RUNNER_CONTAINER, "cat", "/etc/mandate-runner/runner.toml"],
+        ["docker", "exec", RUNNER_CONTAINER, "sh", "-c", 'cat "$MANDATE_RUNNER_CONFIG"'],
         capture_output=True,
         text=True,
     ).stdout
     names = re.findall(r'^name = "([^"]+)"', config, re.M)
     if names != [REPO]:
-        raise Fail(f"runner grades {names}; start it with `make runner-up RUNNER_LOCAL=1`")
+        raise Fail(f"runner grades {names}; start it with `make deploy RUNNER_LOCAL=1`")
     if '"make setup", "make check", "make test"' not in config:
         raise Fail("runner's command set is not make setup, make check, make test")
     if f'human_signer_login = "{SIGNER}"' not in config:
@@ -610,8 +620,8 @@ def s1_runner_up(run: Run) -> str:
     real = (Path(__file__).resolve().parent.parent / "config" / "mandate-runner" / "runner.toml").read_text()
     if f'human_signer_login = "{KD}"' not in real or SIGNER in real:
         raise Fail(f"config/mandate-runner/runner.toml must keep {KD} as the signer")
-    if f'branch = "{DEVELOP_BRANCH}"' not in config or "enabled = false" not in config:
-        raise Fail(f"runner's develop_run is not {DEVELOP_BRANCH} with deploy off; update runner.local.toml")
+    if f'branch = "{DEVELOP_BRANCH}"' not in config or f'container = "{DEPLOYED}"' not in config:
+        raise Fail(f"runner's develop_run is not {DEVELOP_BRANCH} deploying {DEPLOYED}; update runner.local.toml")
     if networks(RUNNER_CONTAINER) != ["lab_local", "mandate_runner_sandbox"]:
         raise Fail(f"{RUNNER_CONTAINER} is on {networks(RUNNER_CONTAINER)}")
     logs = subprocess.run(["docker", "logs", RUNNER_CONTAINER], capture_output=True, text=True).stdout
@@ -812,9 +822,9 @@ def s12_red_develop_freezes(run: Run) -> str:
         ref=f"refs/heads/{DEVELOP_BRANCH}",
         sha=run.develop_sha(),
     )
-    red = run.put_file(DEVELOP_BRANCH, "Makefile", makefile + RED_JOURNEYS)
+    red = run.put_file(DEVELOP_BRANCH, "Makefile", makefile + RED_VERIFY)
     run.develop_heads.append(red)
-    say(f"  {DEVELOP_BRANCH} at {red[:12]}: Makefile journeys target that fails (stands in for a red merge)")
+    say(f"  {DEVELOP_BRANCH} at {red[:12]}: a verify target whose journey fails (stands in for a red merge)")
     issue = wait_for("the runner's freeze issue", lambda: freeze_issues(run))[0]
     run.freeze_issue = issue["number"]
     say(f"  {RUNNER_BOT} opened #{issue['number']}: {issue['title']}")
@@ -822,8 +832,8 @@ def s12_red_develop_freezes(run: Run) -> str:
     if f"https://github.com/{REPO}/commit/{red}" not in body:
         raise Fail(f"#{issue['number']} does not link the merge commit {red[:12]}")
     log_url = re.search(r"Run log: (\S+)", body)
-    if not log_url or "make journeys failed" not in fetch_log(log_url.group(1)):
-        raise Fail(f"#{issue['number']} does not link a run log showing make journeys failed")
+    if not log_url or "make verify failed" not in fetch_log(log_url.group(1)):
+        raise Fail(f"#{issue['number']} does not link a run log showing make verify failed")
     status = run.wait(clean.head, "failure", "develop is red", timeout=RULE_TIMEOUT)
     if status.get("target_url") != issue["html_url"]:
         raise Fail(f"the freeze status links {status.get('target_url')}, not the issue")
@@ -854,9 +864,9 @@ def s13_green_run_clears_the_freeze(run: Run) -> str:
         raise Fail("no freeze issue from scenario 12")
     clean = run.prs["clean"]
     makefile = base64.b64decode(kd_api("GET", f"repos/{REPO}/contents/Makefile?ref=develop")["content"]).decode()
-    green = run.put_file(DEVELOP_BRANCH, "Makefile", makefile + GREEN_JOURNEYS)
+    green = run.put_file(DEVELOP_BRANCH, "Makefile", makefile + GREEN_VERIFY)
     run.develop_heads.append(green)
-    say(f"  {DEVELOP_BRANCH} at {green[:12]}: journeys pass (stands in for the merged fix)")
+    say(f"  {DEVELOP_BRANCH} at {green[:12]}: the journey passes (stands in for the merged fix)")
 
     def closed() -> dict[str, Any] | None:
         issue = run.builder.call("GET", f"/repos/{REPO}/issues/{run.freeze_issue}")
@@ -870,7 +880,79 @@ def s13_green_run_clears_the_freeze(run: Run) -> str:
     if not any(green[:12] in c["body"] and c["user"]["login"] == RUNNER_BOT for c in comments):
         raise Fail(f"#{run.freeze_issue} has no runner comment naming the green head {green[:12]}")
     run.wait(clean.head, "success", timeout=RULE_TIMEOUT)
+    fix = run.prs.get("fix")
+    if fix is not None:
+        run.wait(fix.head, "success", timeout=5)
     return f"green run on {green[:12]}: {RUNNER_BOT} closed #{run.freeze_issue}; #{clean.number} back to success"
+
+
+def s14_signed_fix_gets_through_the_freeze(run: Run) -> str:
+    if run.freeze_issue is None:
+        raise Fail("no freeze issue from scenario 12")
+    number = run.freeze_issue
+    doc = f"docs/verify-runner/{run.tag}-fix.md"
+    pr = run.task_pr("fix", "the fix for the red develop", {doc: f"verify-runner-live {run.tag}: the fix\n"},
+                     body=f"Fixes #{number}")  # fmt: skip
+    run.challenger_approve(pr, "Challenger: first")
+    frozen = run.wait(pr.head, "failure", "develop is red")  # the fix too, until the signer approves
+    run.signer_approve(pr, f"verify-runner-live {run.tag}: the signed fix for #{number}.")
+    run.wait(pr.head, "success", timeout=RULE_TIMEOUT)
+    still = run.latest(run.prs["clean"].head) or {}
+    if "develop is red" not in (still.get("description") or ""):
+        raise Fail("another task PR was let through with the fix")
+    return (
+        f"#{pr.number} ('Fixes #{number}') failed '{frozen['description']}' until {SIGNER}'s Approve, then "
+        f"success while #{number} stayed open; #{run.prs['clean'].number} still frozen"
+    )
+
+
+def s15_merge_deploys_and_verifies(run: Run) -> str:
+    """After the green merge: the head runs on lab_local as the service, migrated, and verify passed against it."""
+    green = run.develop_heads[-1] if run.develop_heads else None
+    if green is None:
+        raise Fail("no develop head from scenarios 12-13")
+    inspect = subprocess.run(
+        ["docker", "inspect", "-f", '{{.State.Running}} {{index .Config.Labels "mandate.head"}}', DEPLOYED],
+        capture_output=True, text=True,
+    ).stdout.split()  # fmt: skip
+    if inspect != ["true", green]:
+        raise Fail(f"{DEPLOYED} is {inspect or 'missing'}, expected running at {green[:12]}")
+    if networks(DEPLOYED) != ["lab_local"]:
+        raise Fail(f"{DEPLOYED} is on {networks(DEPLOYED)}, expected lab_local")
+    health = subprocess.run(
+        ["docker", "exec", DEPLOYED, "curl", "-fsS", "http://localhost:8000/health"], capture_output=True, text=True
+    ).stdout.strip()
+    if '"status":"ok"' not in health.replace(" ", ""):
+        raise Fail(f"{DEPLOYED} /health answers {health[:80]!r}")
+    migrated = subprocess.run(
+        ["docker", "exec", "lab-postgres", "psql", "-U", "mandate_owner", "-d", DEPLOYED_DB, "-Atc",
+         "select to_regclass('public.alembic_version') is not null"],
+        capture_output=True, text=True,
+    ).stdout.strip()  # fmt: skip
+    if migrated != "t":  # the entrypoint's migration step ran (sandbox-svc has no revisions yet)
+        raise Fail(f"{DEPLOYED_DB} has no migration table ({migrated!r})")
+    logs = run_logs_for(green)
+    log = "\n".join(fetch_log(f"{LOG_SERVER}/runs/{name}") for name in logs)
+    for needle in (f"runs {green[:12]} and answers", "make setup, make verify passed against", "/health answers ok"):
+        if needle not in log:
+            raise Fail(f"the develop run log for {green[:12]} lacks '{needle}'")
+    purge = subprocess.run(
+        ["docker", "exec", RUNNER_CONTAINER, "python", "-c",
+         "from pathlib import Path; from mandate_runner.deployer import DeployerClient as C; "
+         "r = C(Path('/jobs')).purge(); print(r.ok, r.message)"],
+        capture_output=True, text=True, timeout=600,
+    ).stdout.strip()  # fmt: skip
+    kept = subprocess.run(
+        ["docker", "exec", "lab-postgres", "psql", "-U", "mandate_owner", "-d", DEPLOYED_DB, "-Atc",
+         "select to_regclass('public.alembic_version') is not null"],
+        capture_output=True, text=True,
+    ).stdout.strip()  # fmt: skip
+    if not purge.startswith("True") or kept != "t":
+        raise Fail(f"purge: {purge!r}; migration table afterwards: {kept!r}")
+    return (
+        f"{DEPLOYED} runs {green[:12]} on lab_local and answers /health; {DEPLOYED_DB} migrated; make verify passed "
+        f"against it ({len(logs)} run log); purge deleted the data and kept the schema"
+    )
 
 
 def s10_statuses_by_runner(run: Run) -> str:
@@ -923,7 +1005,9 @@ SCENARIOS: list[tuple[int, str, Scenario]] = [
         "a red develop freezes a task PR that would otherwise pass",
         s12_red_develop_freezes,
     ),
+    (14, "while frozen, the signed fix gets through", s14_signed_fix_gets_through_the_freeze),
     (13, "a green run clears the freeze", s13_green_run_clears_the_freeze),
+    (15, "a merge is deployed to the lab, migrated, and verified against", s15_merge_deploys_and_verifies),
     (
         10,
         "every status created by mandate-runner[bot]",
@@ -1006,6 +1090,9 @@ def cleanup(run: Run | None, builder: App) -> list[str]:
     if run is not None and run.created_label:
         kd("label", "delete", WAVE_LABEL, "-R", REPO, "--yes")
         done.append(f"deleted label {WAVE_LABEL}")
+    gone = subprocess.run(["docker", "rm", "-f", DEPLOYED], capture_output=True, text=True)
+    if gone.returncode == 0 and gone.stdout.strip():
+        done.append(f"removed {DEPLOYED} (its database {DEPLOYED_DB} is kept for the next run)")
     if run is not None and not run.had_freeze_label:
         if (
             subprocess.run(

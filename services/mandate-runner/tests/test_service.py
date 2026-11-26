@@ -124,7 +124,7 @@ class FakeExecutor:
         if self.develop_result == "error":
             raise RuntimeError("sandbox unreachable")
         if self.develop_result == "red":
-            return CommandsResult(passed=False, failed_command="make journeys", run_id=run_id)
+            return CommandsResult(passed=False, failed_command="make verify", run_id=run_id)
         if self.develop_result == "green":
             return CommandsResult(passed=True, failed_command=None, run_id=run_id)
         return CommandsResult(passed=True, failed_command=None, run_id=run_id, note="nothing to deploy yet")
@@ -161,7 +161,11 @@ def test_unchanged_head_is_not_graded_twice(cfg, gh, tmp_path):
     for _ in range(5):
         runner.poll_once()
     assert len(ex.runs) == 1
-    assert ex.runs[0] == ("drivestream-lab/mandate", HEAD, ("make setup", "make check", "make test", "make journeys"))
+    assert ex.runs[0] == (
+        "drivestream-lab/mandate",
+        HEAD,
+        ("make setup", "make check", "make test", "make deploy", "make verify"),
+    )
     assert states(gh) == [("aaaa", "success")]
 
 
@@ -264,7 +268,7 @@ def test_run_log_is_kept_and_records_the_status(cfg, gh, tmp_path):
     logs = list((tmp_path / "logs").glob("*.log"))
     assert len(logs) == 1
     text = logs[0].read_text()
-    assert "pinned commands (runner config): make setup, make check, make test, make journeys" in text
+    assert "pinned commands (runner config): make setup, make check, make test, make deploy, make verify" in text
     assert "posted mandate/build-verified = success" in text
     assert gh.statuses[0][4].endswith("/runs/" + logs[0].name)
 

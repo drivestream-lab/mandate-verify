@@ -11,7 +11,7 @@ def test_real_config_pins_pl16_identities_and_commands(cfg):
     assert cfg.identities.human_signer_login == "nikd10x"
     assert {r.name for r in cfg.repos} == {"drivestream-lab/mandate", "drivestream-lab/mandate-control-tower"}
     for base in ("develop", "main"):
-        assert cfg.bases[base].commands == ("make setup", "make check", "make test", "make journeys")
+        assert cfg.bases[base].commands == ("make setup", "make check", "make test", "make deploy", "make verify")
 
 
 def test_real_config_lists_every_pl16_protected_path(cfg):
@@ -49,7 +49,8 @@ def _develop_run() -> dict:
         "repo": "o/r", "branch": "develop", "task_base": "main", "commands": ["make journeys"],
         "freeze_label": "develop-red",
         "deploy": {"enabled": True, "container": "lab-mandate", "network": "lab_local", "image_repo": "o/r",
-                   "env_file": "/config/mandate.env", "database": "mandate_lab", "health_url": "http://l/health"},
+                   "env_file": "/config/mandate.env", "database": "mandate", "health_url": "http://l/health",
+                   "service_url": "http://lab-mandate:8000/"},
     }  # fmt: skip
 
 
@@ -57,10 +58,11 @@ def test_real_config_runs_develop_on_mandate_and_deploys_it(cfg):
     dr = cfg.develop_run
     assert dr is not None
     assert (dr.repo, dr.branch, dr.task_base) == ("drivestream-lab/mandate", "develop", "develop")
-    assert dr.commands == ("make setup", "make journeys")
+    assert dr.commands == ("make setup", "make verify")
     assert dr.freeze_label == "develop-red"
     assert dr.deploy.enabled and dr.deploy.container == "lab-mandate" and dr.deploy.network == "lab_local"
-    assert dr.deploy.database == "mandate_lab"
+    assert dr.deploy.database == "mandate"
+    assert dr.deploy.service_url == "http://lab-mandate:8000"
     assert cfg.identities.runner_login == "mandate-runner[bot]"
 
 
