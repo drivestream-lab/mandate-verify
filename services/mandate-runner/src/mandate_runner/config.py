@@ -19,6 +19,7 @@ class Identities:
     challenger_app_id: int
     challenger_login: str
     human_signer_login: str
+    runner_login: str
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,37 @@ class RepoRules:
 
 
 @dataclass(frozen=True)
+class DeployRules:
+    """How the deployer runs the merged head on the lab stack (B0-02)."""
+
+    enabled: bool
+    container: str
+    network: str
+    image_repo: str
+    env_file: str
+    database: str
+    health_url: str
+
+
+@dataclass(frozen=True)
+class DevelopRun:
+    """After every merge into the branch: deploy the head, then run every journey (B0-02)."""
+
+    repo: str
+    branch: str
+    task_base: str
+    commands: tuple[str, ...]
+    freeze_label: str
+    deploy: DeployRules
+
+
+@dataclass(frozen=True)
+class SandboxRules:
+    rebuild_interval_hours: int
+    rebuild_after_failure: bool
+
+
+@dataclass(frozen=True)
 class Config:
     poll_interval_seconds: int
     status_context: str
@@ -64,6 +96,8 @@ class Config:
     wave: WaveRules
     bases: dict[str, BaseRules]
     repos: tuple[RepoRules, ...]
+    develop_run: DevelopRun | None
+    sandbox: SandboxRules
 
     def repo(self, name: str) -> RepoRules:
         for repo in self.repos:
@@ -98,6 +132,7 @@ def parse(raw: dict[str, Any]) -> Config:
         challenger_app_id=_get(ids, "challenger_app_id", int, "identities"),
         challenger_login=_get(ids, "challenger_login", str, "identities"),
         human_signer_login=_get(ids, "human_signer_login", str, "identities"),
+        runner_login=_get(ids, "runner_login", str, "identities"),
     )
     m = _get(raw, "markers", dict, "config")
     markers = Markers(first=_get(m, "first", str, "markers"), second=_get(m, "second", str, "markers"))
@@ -131,6 +166,14 @@ def parse(raw: dict[str, Any]) -> Config:
         )
     if not repos:
         raise ConfigError("repos: at least one repo is required")
+    develop_run = _develop_run(raw["develop_run"], bases) if "develop_run" in raw else None
+    sb = _get(raw, "sandbox", dict, "config")
+    sandbox = SandboxRules(
+        rebuild_interval_hours=_get(sb, "rebuild_interval_hours", int, "sandbox"),
+        rebuild_after_failure=_get(sb, "rebuild_after_failure", bool, "sandbox"),
+    )
+    if sandbox.rebuild_interval_hours < 1:
+        raise ConfigError("sandbox: rebuild_interval_hours must be at least 1")
     interval = _get(raw, "poll_interval_seconds", int, "config")
     if interval < 5:
         raise ConfigError("poll_interval_seconds must be at least 5")
@@ -148,6 +191,37 @@ def parse(raw: dict[str, Any]) -> Config:
         wave=wave,
         bases=bases,
         repos=tuple(repos),
+        develop_run=develop_run,
+        sandbox=sandbox,
+    )
+
+
+def _develop_run(table: Any, bases: dict[str, BaseRules]) -> DevelopRun:
+    if not isinstance(table, dict):
+        raise ConfigError("develop_run must be a table")
+    commands = _strings(table, "commands", "develop_run")
+    if not commands:
+        raise ConfigError("develop_run: commands must not be empty")
+    task_base = _get(table, "task_base", str, "develop_run")
+    if task_base not in bases:
+        raise ConfigError(f"develop_run: task_base '{task_base}' has no command set in bases")
+    d = _get(table, "deploy", dict, "develop_run")
+    deploy = DeployRules(
+        enabled=_get(d, "enabled", bool, "develop_run.deploy"),
+        container=_get(d, "container", str, "develop_run.deploy"),
+        network=_get(d, "network", str, "develop_run.deploy"),
+        image_repo=_get(d, "image_repo", str, "develop_run.deploy"),
+        env_file=_get(d, "env_file", str, "develop_run.deploy"),
+        database=_get(d, "database", str, "develop_run.deploy"),
+        health_url=_get(d, "health_url", str, "develop_run.deploy"),
+    )
+    return DevelopRun(
+        repo=_get(table, "repo", str, "develop_run"),
+        branch=_get(table, "branch", str, "develop_run"),
+        task_base=task_base,
+        commands=commands,
+        freeze_label=_get(table, "freeze_label", str, "develop_run"),
+        deploy=deploy,
     )
 
 

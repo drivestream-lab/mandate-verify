@@ -12,7 +12,7 @@ from urllib.parse import quote
 import httpx
 import jwt
 
-from .models import PullRequest, Review
+from .models import Issue, PullRequest, Review
 from .secrets import AppCredentials
 
 API = "https://api.github.com"
@@ -31,6 +31,12 @@ class GitHub(Protocol):
     def merge_base(self, repo: str, base_sha: str, head_sha: str) -> str: ...
     def file_at(self, repo: str, path: str, ref: str) -> bytes | None: ...
     def post_status(self, repo: str, sha: str, state: str, description: str, target_url: str | None) -> None: ...
+    def branch_head(self, repo: str, branch: str) -> str | None: ...
+    def list_open_issues(self, repo: str, label: str) -> list[Issue]: ...
+    def open_issue(self, repo: str, title: str, body: str, label: str) -> Issue: ...
+    def comment_issue(self, repo: str, number: int, body: str) -> None: ...
+    def close_issue(self, repo: str, number: int, comment: str) -> None: ...
+    def now(self) -> float: ...
 
 
 class GitHubApp:
@@ -54,6 +60,10 @@ class GitHubApp:
 
     def _now(self) -> float:
         return time.time() + self._skew
+
+    def now(self) -> float:
+        """Wall time by GitHub's clock once a skew has been seen (Docker Desktop drifts after sleep)."""
+        return self._now()
 
     def _app_jwt(self) -> str:
         now = int(self._now())
@@ -166,6 +176,7 @@ class GitHubApp:
                     base_sha=p["base"]["sha"],
                     draft=bool(p.get("draft")),
                     labels=frozenset(label["name"] for label in p.get("labels", [])),
+                    body=p.get("body") or "",
                 )
             )
         return out
@@ -216,4 +227,49 @@ class GitHubApp:
         if target_url:
             body["target_url"] = target_url
         resp = self._request("POST", f"/repos/{repo}/statuses/{sha}", json=body)
+        resp.raise_for_status()
+
+    def branch_head(self, repo: str, branch: str) -> str | None:
+        resp = self._request("GET", f"/repos/{repo}/branches/{quote(branch, safe='')}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()["commit"]["sha"]
+
+    # --- freeze issues -------------------------------------------------------
+
+    @staticmethod
+    def _issue(repo: str, i: dict[str, Any]) -> Issue:
+        return Issue(repo=repo, number=i["number"], url=i["html_url"], author=(i.get("user") or {}).get("login", ""))
+
+    def list_open_issues(self, repo: str, label: str) -> list[Issue]:
+        items = self._paginate(f"/repos/{repo}/issues", state="open", labels=label)
+        return [self._issue(repo, i) for i in items if "pull_request" not in i]
+
+    def _ensure_label(self, repo: str, label: str) -> None:
+        resp = self._request("GET", f"/repos/{repo}/labels/{quote(label, safe='')}")
+        if resp.status_code == 404:
+            made = self._request(
+                "POST",
+                f"/repos/{repo}/labels",
+                json={"name": label, "color": "b60205", "description": "develop is red: task PRs are frozen"},
+            )
+            if made.status_code != 422:  # 422: created meanwhile
+                made.raise_for_status()
+            return
+        resp.raise_for_status()
+
+    def open_issue(self, repo: str, title: str, body: str, label: str) -> Issue:
+        self._ensure_label(repo, label)
+        resp = self._request("POST", f"/repos/{repo}/issues", json={"title": title, "body": body, "labels": [label]})
+        resp.raise_for_status()
+        return self._issue(repo, resp.json())
+
+    def comment_issue(self, repo: str, number: int, body: str) -> None:
+        resp = self._request("POST", f"/repos/{repo}/issues/{number}/comments", json={"body": body})
+        resp.raise_for_status()
+
+    def close_issue(self, repo: str, number: int, comment: str) -> None:
+        self.comment_issue(repo, number, comment)
+        resp = self._request("PATCH", f"/repos/{repo}/issues/{number}", json={"state": "closed"})
         resp.raise_for_status()

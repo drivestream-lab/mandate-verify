@@ -26,6 +26,7 @@ challenger_app_slug = "mandate-challenger"
 challenger_app_id = 5860827
 challenger_login = "mandate-challenger[bot]"
 human_signer_login = "nikd10x"
+runner_login = "mandate-runner[bot]"
 
 # A challenger review counts for a slot only when its body carries exactly one of
 # these lines. Trust-critical paths need both, on separate reviews of the head.
@@ -47,6 +48,38 @@ commands = ["make check", "make test", "make journeys"]
 
 [bases.main]
 commands = ["make check", "make test", "make journeys"]
+
+# The sandbox (Docker-in-Docker) is rebuilt from scratch with `make runner-reset-sandbox`
+# (run by the deployer): once a day, and after any run that did not pass.
+[sandbox]
+rebuild_interval_hours = 24
+rebuild_after_failure = true
+
+# B0-02. After every merge into develop on mandate, the runner checks the merged head
+# out, deploys it to the lab stack as the Mandate service, then runs every journey
+# built so far against the sandbox repos. Until the head has a Dockerfile and a
+# `journeys` Makefile target, the run records "nothing to deploy yet" and passes.
+# A red run opens a bug issue on the repo (as mandate-runner, labelled freeze_label).
+# While one is open, every PR into task_base fails with "develop is red", except a PR
+# whose body says `Fixes #N` (or `drivestream-lab/mandate#N`) and has nikd10x's Approve
+# on its head. The runner closes the issue after a green run, which lifts the freeze.
+[develop_run]
+repo = "drivestream-lab/mandate"
+branch = "develop"
+task_base = "develop"
+commands = ["make setup", "make journeys"]
+freeze_label = "develop-red"
+
+[develop_run.deploy]
+enabled = true
+container = "lab-mandate"
+network = "lab_local"
+image_repo = "drivestream-lab/mandate"
+# Inside the deployer: ~/.mandate/lab/mandate.env on the host (KD's, outside the repos).
+env_file = "/config/mandate.env"
+# The env file must point the service at its own database on lab-postgres.
+database = "mandate_lab"
+health_url = "http://localhost:8000/health"
 
 [[repos]]
 name = "drivestream-lab/mandate"

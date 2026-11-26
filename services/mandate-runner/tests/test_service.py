@@ -54,6 +54,11 @@ class FakeGitHub:
         self.files = {}
         self.statuses = []
         self.calls = {"list_changed_paths": 0}
+        self.heads = {}
+        self.issues = []
+        self.opened = []
+        self.comments = []
+        self.closed = []
 
     def list_open_prs(self, repo):
         return list(self.prs[repo])
@@ -74,12 +79,58 @@ class FakeGitHub:
     def post_status(self, repo, sha, state, description, target_url):
         self.statuses.append((repo, sha, state, description, target_url))
 
+    # B0-02: develop head and freeze issues
+    def branch_head(self, repo, branch):
+        return self.heads.get((repo, branch))
+
+    def list_open_issues(self, repo, label):
+        return [i for i in self.issues if i.repo == repo]
+
+    def open_issue(self, repo, title, body, label):
+        from mandate_runner.models import Issue
+
+        issue = Issue(
+            repo=repo,
+            number=100 + len(self.opened),
+            url=f"https://github.com/{repo}/issues/x",
+            author="mandate-runner[bot]",
+        )
+        self.opened.append((repo, title, body, label))
+        self.issues = [*self.issues, issue]
+        return issue
+
+    def comment_issue(self, repo, number, body):
+        self.comments.append((number, body))
+
+    def close_issue(self, repo, number, comment):
+        self.closed.append((number, comment))
+        self.issues = [i for i in self.issues if i.number != number]
+
+    def now(self):
+        return 0.0
+
 
 class FakeExecutor:
     def __init__(self, fail_on=None, error=False):
         self.runs = []
         self.fail_on = fail_on
         self.error = error
+        self.develop_runs = []
+        self.develop_result = None  # None: nothing to deploy yet
+        self.rebuilds = 0
+
+    def run_develop(self, repo, sha, commands, run_id, runlog, deploy):
+        self.develop_runs.append((repo, sha, commands))
+        if self.develop_result == "error":
+            raise RuntimeError("sandbox unreachable")
+        if self.develop_result == "red":
+            return CommandsResult(passed=False, failed_command="make journeys", run_id=run_id)
+        if self.develop_result == "green":
+            return CommandsResult(passed=True, failed_command=None, run_id=run_id)
+        return CommandsResult(passed=True, failed_command=None, run_id=run_id, note="nothing to deploy yet")
+
+    def rebuild_sandbox(self, runlog):
+        self.rebuilds += 1
 
     def run(self, repo, sha, commands, run_id, runlog):
         self.runs.append((repo, sha, commands))

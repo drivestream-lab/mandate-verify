@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Live verification of mandate-runner (B0-01) before B0-02.
 
-Runs ten scenarios against the RUNNING runner and checks each mandate/build-verified
-status it posts. The runner must be started with the local override, which points it
-at drivestream-lab/mandate-sandbox-svc only, with make setup, make check, make test:
+Runs thirteen scenarios against the RUNNING runner and checks each mandate/build-verified
+status it posts, plus the develop run and merge freeze (B0-02). The runner must be
+started with the local override, which points it at drivestream-lab/mandate-sandbox-svc
+only, with make setup, make check, make test, a develop run on a test branch, and a
+separate test signer:
 
     make runner-up RUNNER_LOCAL=1
     make verify-runner-live            # or: ARGS=--cleanup to sweep leftovers only
@@ -15,7 +17,10 @@ Who does what:
     so KD is never the author and can approve.
   - mandate-challenger (~/.mandate/secrets/build/mandate-challenger/) posts the
     challenger Approves.
-  - KD approves by hand when the script pauses (scenarios 6 and 8).
+  - The test signer 0xbeefdead (gh on this machine, `gh auth token --user 0xbeefdead`)
+    posts the signer Approves (scenarios 6 and 8). Only the gitignored override names
+    it; the real runner.toml keeps nikd10x, so Mandate's own repos still need KD.
+    Scenario 1 checks both, so the two can't be swapped.
 
 Every test PR is closed and every test branch deleted at the end, even on failure.
 The script never prints keys or tokens. It reads the runner's logs through
@@ -45,7 +50,8 @@ REPO = "drivestream-lab/mandate-sandbox-svc"
 API = "https://api.github.com"
 CONTEXT = "mandate/build-verified"
 RUNNER_BOT = "mandate-runner[bot]"
-KD = "nikd10x"
+KD = "nikd10x"  # gh's active account: pushes branches, labels; the real config's signer
+SIGNER = "0xbeefdead"  # the override's test signer, for the live check only
 INITIATIVE = "INIT-MANDATE-001"
 WAVE_LABEL = "wave-accepted"
 SECRETS = Path.home() / ".mandate" / "secrets" / "build"
@@ -57,7 +63,6 @@ TITLE = "[verify-runner-live]"
 
 RUN_TIMEOUT = 30 * 60  # first run builds the job image and runs make setup
 RULE_TIMEOUT = 3 * 60  # a review change shows within a poll or two
-KD_TIMEOUT = 60 * 60  # waiting for KD's hand
 SETTLE = 75  # two polls: long enough to see that nothing changes
 
 LEAK_PATTERNS = (
@@ -98,10 +103,17 @@ class App:
     def _bearer(self) -> str:
         if time.time() > self._expires - 300:
             now = int(time.time())
-            token = jwt.encode({"iat": now - 60, "exp": now + 540, "iss": self._app_id}, self._key, algorithm="RS256")
+            token = jwt.encode(
+                {"iat": now - 60, "exp": now + 540, "iss": self._app_id},
+                self._key,
+                algorithm="RS256",
+            )
             resp = self._http.post(
                 f"{API}/app/installations/{self._installation}/access_tokens",
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
             )
             if resp.status_code != 201:
                 raise Fail(f"{self.name}: cannot mint an installation token (HTTP {resp.status_code})")
@@ -183,6 +195,9 @@ class Run:
     challenger: App
     prs: dict[str, TestPR] = field(default_factory=dict)
     created_label: bool = False
+    had_freeze_label: bool = True
+    freeze_issue: int | None = None
+    develop_heads: list[str] = field(default_factory=list)
 
     # --- branches and PRs ---------------------------------------------------------
 
@@ -192,7 +207,12 @@ class Run:
     def push_branch(self, key: str, files: dict[str, str | None]) -> tuple[str, str]:
         """Branch from develop with KD's gh; `None` content means append to the existing file."""
         branch = f"{PREFIX}{self.tag}-{key}"
-        kd_api("POST", f"repos/{REPO}/git/refs", ref=f"refs/heads/{branch}", sha=self.develop_sha())
+        kd_api(
+            "POST",
+            f"repos/{REPO}/git/refs",
+            ref=f"refs/heads/{branch}",
+            sha=self.develop_sha(),
+        )
         head = ""
         for path, content in files.items():
             head = self.put_file(branch, path, content)
@@ -201,7 +221,10 @@ class Run:
     def put_file(self, branch: str, path: str, content: str | None) -> str:
         fields = {"message": f"verify-runner-live {self.tag}: {path}", "branch": branch}
         existing = subprocess.run(
-            ["gh", "api", f"repos/{REPO}/contents/{path}?ref={branch}"], capture_output=True, text=True, timeout=60
+            ["gh", "api", f"repos/{REPO}/contents/{path}?ref={branch}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         if existing.returncode == 0:
             current = json.loads(existing.stdout)
@@ -214,7 +237,14 @@ class Run:
         return kd_api("PUT", f"repos/{REPO}/contents/{path}", **fields)["commit"]["sha"]
 
     def open_pr(
-        self, key: str, branch: str, head: str, title: str, *, base: str = "develop", draft: bool = False
+        self,
+        key: str,
+        branch: str,
+        head: str,
+        title: str,
+        *,
+        base: str = "develop",
+        draft: bool = False,
     ) -> TestPR:
         pr = self.builder.call(
             "POST",
@@ -259,25 +289,26 @@ class Run:
         )
         say(f"mandate-challenger approved #{pr.number} at {pr.head[:12]} ({marker})")
 
-    def wait_for_kd(self, pr: TestPR, body: str | None) -> None:
-        cmd = f"gh pr review {pr.number} -R {REPO} --approve"
-        if body is not None:
-            cmd += " --body $'" + body.replace("\n", "\\n") + "'"
-        say("=" * 72)
-        say(f"PAUSED FOR KD: approve #{pr.number} at head {pr.head}")
-        say(f"  https://github.com/{REPO}/pull/{pr.number}")
-        say(f"  or run:  {cmd}")
-        say("=" * 72)
-        deadline = time.time() + KD_TIMEOUT
-        while time.time() < deadline:
-            reviews = self.builder.call("GET", f"/repos/{REPO}/pulls/{pr.number}/reviews", per_page=100)
-            if any(
-                r["user"]["login"] == KD and r["state"] == "APPROVED" and r["commit_id"] == pr.head for r in reviews
-            ):
-                say(f"KD approved #{pr.number}; resuming")
-                return
-            time.sleep(15)
-        raise Fail(f"no Approve from {KD} on #{pr.number} within {KD_TIMEOUT // 60} minutes")
+    def signer_approve(self, pr: TestPR, body: str | None) -> None:
+        """The test signer's Approve on the head, with its own gh token (never printed)."""
+        token = subprocess.run(
+            ["gh", "auth", "token", "--user", SIGNER], capture_output=True, text=True, timeout=30
+        ).stdout.strip()
+        if not token:
+            raise Fail(f"gh has no token for {SIGNER}: gh auth login, then retry")
+        resp = httpx.post(
+            f"{API}/repos/{REPO}/pulls/{pr.number}/reviews",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            json={
+                "commit_id": pr.head,
+                "event": "APPROVE",
+                "body": body or f"verify-runner-live {self.tag}: test signer Approve.",
+            },
+            timeout=30,
+        )
+        if resp.status_code >= 300:
+            raise Fail(f"{SIGNER} could not approve #{pr.number}: HTTP {resp.status_code}")
+        say(f"{SIGNER} (test signer) approved #{pr.number} at {pr.head[:12]}")
 
     # --- statuses -----------------------------------------------------------------
 
@@ -445,6 +476,109 @@ def test_job_sees_no_build_key_or_token() -> None:
     assert not found
 '''
 
+ISOLATION_PROBE = r'''"""verify-runner-live: PR code in the sandbox must not reach the lab's services.
+
+Tries each lab service directly (by its lab_local address and through Docker
+Desktop's host address, where the lab publishes its ports), then from the sandbox
+engine's own network (docker run --network host), then through the egress proxy.
+Only the proxy's way to the public internet may work.
+"""
+
+import os
+import socket
+import subprocess
+import warnings
+from urllib.parse import urlsplit
+
+TARGETS = __TARGETS__
+
+
+def reach(host: str, port: int) -> bool:
+    try:
+        socket.create_connection((host, port), timeout=3).close()
+        return True
+    except OSError:
+        return False
+
+
+def proxy_connect(host: str, port: int) -> str:
+    proxy = urlsplit(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "")
+    if not proxy.hostname:
+        return "no proxy configured"
+    with socket.create_connection((proxy.hostname, proxy.port or 3128), timeout=10) as s:
+        s.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
+        return s.recv(200).split(b"\r\n", 1)[0].decode(errors="replace")
+
+
+def hostnet_reached() -> list[str]:
+    script = "; ".join(
+        f"nc -z -w3 {h} {p} && echo REACHED {label}" for label, h, p in TARGETS if not h.startswith("host.")
+    )
+    res = subprocess.run(
+        ["docker", "run", "--rm", "--network", "host", "busybox:1.37", "sh", "-c", script + "; true"],
+        capture_output=True, text=True, timeout=600,
+    )
+    if res.returncode != 0:
+        raise AssertionError(f"could not probe from the engine's network: {res.stderr.strip()[:200]}")
+    warnings.warn("ISOLATION_PROBE_HOSTNET: searched")
+    return [line.split(" ", 1)[1] for line in res.stdout.splitlines() if line.startswith("REACHED ")]
+
+
+def test_sandbox_cannot_reach_the_lab() -> None:
+    reached = []
+    for label, host, port in TARGETS:
+        ok = reach(host, port)
+        warnings.warn(f"ISOLATION_PROBE {label} {host}:{port} {'REACHABLE' if ok else 'blocked'}")
+        if ok:
+            reached.append(label)
+    reached += [f"hostnet:{label}" for label in hostnet_reached()]
+    via_proxy = proxy_connect("192.168.65.254", 443)
+    warnings.warn(f"ISOLATION_PROBE_PROXY_LAB: {via_proxy}")
+    if " 200 " in f"{via_proxy} ":
+        reached.append("proxy:192.168.65.254:443")
+    public = proxy_connect("pypi.org", 443)
+    warnings.warn(f"ISOLATION_PROBE_PROXY_PUBLIC: {public}")
+    assert " 200 " in f"{public} ", "the proxy should still reach the public internet"
+    warnings.warn(f"ISOLATION_PROBE_RESULT: {'REACHED ' + str(reached) if reached else 'blocked'}")
+    assert not reached
+'''
+
+
+def lab_targets() -> list[tuple[str, str, int]]:
+    """The lab's services by their lab_local address, and through Docker Desktop's host address."""
+    targets: list[tuple[str, str, int]] = []
+    for name, port in (
+        ("lab-postgres", 5432),
+        ("lab-redis", 6379),
+        ("lab-litellm", 8000),
+        ("lab-paperclip", 3100),
+    ):
+        ip = subprocess.run(
+            ["docker", "inspect", "-f", '{{(index .NetworkSettings.Networks "lab_local").IPAddress}}', name],
+            capture_output=True, text=True,
+        ).stdout.strip()  # fmt: skip
+        if ip:
+            targets.append((f"{name}@lab_local", ip, port))
+    for label, port in (
+        ("postgres", 5432),
+        ("redis", 6379),
+        ("litellm", 4000),
+        ("paperclip", 3100),
+    ):
+        targets.append((f"{label}@host", "192.168.65.254", port))
+    targets.append(("postgres@host.docker.internal", "host.docker.internal", 5432))
+    return targets
+
+
+def isolation_probe() -> str:
+    return ISOLATION_PROBE.replace("__TARGETS__", repr(lab_targets()))
+
+
+DEVELOP_BRANCH = "chore/verify-runner-develop"  # the override's develop_run.branch
+FREEZE_LABEL = "develop-red"
+RED_JOURNEYS = "\njourneys:\n\t@echo 'verify-runner-live: a red journey'; exit 1\n"
+GREEN_JOURNEYS = "\njourneys:\n\t@echo 'verify-runner-live: every journey passed'\n"
+
 
 # --- scenarios --------------------------------------------------------------------------
 
@@ -453,7 +587,9 @@ Scenario = Callable[[Run], str]
 
 def s1_runner_up(run: Run) -> str:
     health = subprocess.run(
-        ["docker", "inspect", "-f", "{{.State.Health.Status}}", RUNNER_CONTAINER], capture_output=True, text=True
+        ["docker", "inspect", "-f", "{{.State.Health.Status}}", RUNNER_CONTAINER],
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     if health != "healthy":
         raise Fail(f"{RUNNER_CONTAINER} is '{health or 'missing'}', not healthy")
@@ -469,9 +605,21 @@ def s1_runner_up(run: Run) -> str:
         raise Fail(f"runner grades {names}; start it with `make runner-up RUNNER_LOCAL=1`")
     if '"make setup", "make check", "make test"' not in config:
         raise Fail("runner's command set is not make setup, make check, make test")
+    if f'human_signer_login = "{SIGNER}"' not in config:
+        raise Fail(f"the override's signer is not the test signer {SIGNER}")
+    real = (Path(__file__).resolve().parent.parent / "config" / "mandate-runner" / "runner.toml").read_text()
+    if f'human_signer_login = "{KD}"' not in real or SIGNER in real:
+        raise Fail(f"config/mandate-runner/runner.toml must keep {KD} as the signer")
+    if f'branch = "{DEVELOP_BRANCH}"' not in config or "enabled = false" not in config:
+        raise Fail(f"runner's develop_run is not {DEVELOP_BRANCH} with deploy off; update runner.local.toml")
+    if networks(RUNNER_CONTAINER) != ["lab_local", "mandate_runner_sandbox"]:
+        raise Fail(f"{RUNNER_CONTAINER} is on {networks(RUNNER_CONTAINER)}")
     logs = subprocess.run(["docker", "logs", RUNNER_CONTAINER], capture_output=True, text=True).stdout
     logs += subprocess.run(["docker", "logs", RUNNER_CONTAINER], capture_output=True, text=True).stderr
-    found = leaks(logs, key_fragments((SECRETS / "mandate-runner" / "private-key.pem").read_bytes()))
+    found = leaks(
+        logs,
+        key_fragments((SECRETS / "mandate-runner" / "private-key.pem").read_bytes()),
+    )
     if found:
         raise Fail(f"runner log contains {found}")
     return f"healthy, grading only {REPO}, {len(logs.splitlines())} log lines with no key, token or JWT"
@@ -497,7 +645,11 @@ def s3_approve_flips_without_rerun(run: Run) -> str:
 def s4_new_push_needs_fresh_approval(run: Run) -> str:
     pr = run.prs["clean"]
     old = pr.head
-    new = run.push(pr, f"docs/verify-runner/{run.tag}-second.md", f"verify-runner-live {run.tag}: second push\n")
+    new = run.push(
+        pr,
+        f"docs/verify-runner/{run.tag}-second.md",
+        f"verify-runner-live {run.tag}: second push\n",
+    )
     status = run.wait(new, "failure", "Challenger: first")
     run.wait(old, "success", timeout=5)  # the old head keeps its own result
     run.challenger_approve(pr, "Challenger: first")
@@ -521,9 +673,9 @@ def s6_protected_path_needs_kd(run: Run) -> str:
     pr = run.prs["protected"]
     run.challenger_approve(pr, "Challenger: first")
     status = run.wait(pr.head, "failure", "Makefile is protected")
-    run.wait_for_kd(pr, None)
+    run.signer_approve(pr, None)
     run.wait(pr.head, "success", timeout=RULE_TIMEOUT)
-    return f"#{pr.number}: '{status['description']}', success after KD's Approve"
+    return f"#{pr.number}: '{status['description']}', success after the signer's Approve"
 
 
 def s7_trust_critical_needs_two(run: Run) -> str:
@@ -538,18 +690,42 @@ def s7_trust_critical_needs_two(run: Run) -> str:
 def s8_wave_pr_needs_signoff(run: Run) -> str:
     pr = run.prs["wave"]
     steps = [run.wait(pr.head, "failure", WAVE_LABEL)["description"]]
-    labels = kd("label", "list", "-R", REPO, "--limit", "200", "--json", "name", "-q", ".[].name").split()
+    labels = kd(
+        "label",
+        "list",
+        "-R",
+        REPO,
+        "--limit",
+        "200",
+        "--json",
+        "name",
+        "-q",
+        ".[].name",
+    ).split()
     if WAVE_LABEL not in labels:
-        kd("label", "create", WAVE_LABEL, "-R", REPO, "--description", "Wave close signed by KD", "--color", "0E8A16")
+        kd(
+            "label",
+            "create",
+            WAVE_LABEL,
+            "-R",
+            REPO,
+            "--description",
+            "Wave close signed by KD",
+            "--color",
+            "0E8A16",
+        )
         run.created_label = True
         say(f"created label {WAVE_LABEL} on {REPO} (removed at the end)")
     kd("pr", "edit", str(pr.number), "-R", REPO, "--add-label", WAVE_LABEL)
     steps.append(run.wait(pr.head, "failure", "draft", timeout=RULE_TIMEOUT)["description"])
     kd("pr", "ready", str(pr.number), "-R", REPO)
-    steps.append(run.wait(pr.head, "failure", f"Approve from {KD}", timeout=RULE_TIMEOUT)["description"])
-    run.wait_for_kd(pr, f"Wave accepted (verify-runner-live).\n\nInitiative: {INITIATIVE}\nHead: {pr.head}")
+    steps.append(run.wait(pr.head, "failure", f"Approve from {SIGNER}", timeout=RULE_TIMEOUT)["description"])
+    run.signer_approve(
+        pr,
+        f"Wave accepted (verify-runner-live).\n\nInitiative: {INITIATIVE}\nHead: {pr.head}",
+    )
     run.wait(pr.head, "success", timeout=RULE_TIMEOUT)
-    return f"#{pr.number}: " + " -> ".join(f"'{s}'" for s in steps) + " -> success after KD's attested Approve"
+    return f"#{pr.number}: " + " -> ".join(f"'{s}'" for s in steps) + " -> success after the signer's attested Approve"
 
 
 def s9_no_secrets_in_job(run: Run) -> str:
@@ -570,6 +746,133 @@ def s9_no_secrets_in_job(run: Run) -> str:
     return f"#{pr.number}: probe passed in make test (env, mounts and sandbox engine searched); run log clean"
 
 
+def networks(container: str) -> list[str]:
+    out = subprocess.run(
+        ["docker", "inspect", "-f", "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", container],
+        capture_output=True, text=True,
+    ).stdout  # fmt: skip
+    return sorted(out.split())
+
+
+def s11_sandbox_cannot_reach_the_lab(run: Run) -> str:
+    dind = networks("lab-mandate-runner-dind")
+    if dind != ["mandate_runner_sandbox"]:
+        raise Fail(f"the sandbox is on {dind}, expected only mandate_runner_sandbox")
+    internal = subprocess.run(
+        [
+            "docker",
+            "network",
+            "inspect",
+            "-f",
+            "{{.Internal}}",
+            "mandate_runner_sandbox",
+        ],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if internal != "true":
+        raise Fail("mandate_runner_sandbox is not an internal network")
+    pr = run.prs["isolation"]
+    status = run.wait(pr.head, "failure", "Challenger: first")  # i.e. the commands, probe included, passed
+    log = fetch_log(status["target_url"])
+    if "ISOLATION_PROBE_RESULT: blocked" not in log or "ISOLATION_PROBE_HOSTNET: searched" not in log:
+        raise Fail("the isolation probe's result is missing from the run log")
+    probes = re.findall(r"ISOLATION_PROBE (\S+) \S+ (blocked|REACHABLE)", log)
+    if not probes or any(state != "blocked" for _, state in probes):
+        raise Fail(f"reachable from the sandbox: {[label for label, state in probes if state != 'blocked']}")
+    lab = re.search(r"ISOLATION_PROBE_PROXY_LAB: (.*)", log)
+    return (
+        f"#{pr.number}: sandbox only on the internal network; {len(probes)} lab targets blocked directly and from "
+        f"the engine's host network; proxy to the lab: '{lab.group(1).strip() if lab else '?'}', to PyPI: 200"
+    )
+
+
+def freeze_issues(run: Run, state: str = "open") -> list[dict[str, Any]]:
+    items = run.builder.call("GET", f"/repos/{REPO}/issues", state=state, labels=FREEZE_LABEL, per_page=100)
+    return [i for i in items if "pull_request" not in i and i["user"]["login"] == RUNNER_BOT]
+
+
+def wait_for(what: str, check: Callable[[], Any], timeout: int = RUN_TIMEOUT) -> Any:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = check()
+        if found:
+            return found
+        time.sleep(10)
+    raise Fail(f"timed out waiting for {what}")
+
+
+def s12_red_develop_freezes(run: Run) -> str:
+    clean = run.prs["clean"]
+    run.wait(clean.head, "success", timeout=5)  # passes before the freeze
+    makefile = base64.b64decode(kd_api("GET", f"repos/{REPO}/contents/Makefile?ref=develop")["content"]).decode()
+    kd_api(
+        "POST",
+        f"repos/{REPO}/git/refs",
+        ref=f"refs/heads/{DEVELOP_BRANCH}",
+        sha=run.develop_sha(),
+    )
+    red = run.put_file(DEVELOP_BRANCH, "Makefile", makefile + RED_JOURNEYS)
+    run.develop_heads.append(red)
+    say(f"  {DEVELOP_BRANCH} at {red[:12]}: Makefile journeys target that fails (stands in for a red merge)")
+    issue = wait_for("the runner's freeze issue", lambda: freeze_issues(run))[0]
+    run.freeze_issue = issue["number"]
+    say(f"  {RUNNER_BOT} opened #{issue['number']}: {issue['title']}")
+    body = issue.get("body") or ""
+    if f"https://github.com/{REPO}/commit/{red}" not in body:
+        raise Fail(f"#{issue['number']} does not link the merge commit {red[:12]}")
+    log_url = re.search(r"Run log: (\S+)", body)
+    if not log_url or "make journeys failed" not in fetch_log(log_url.group(1)):
+        raise Fail(f"#{issue['number']} does not link a run log showing make journeys failed")
+    status = run.wait(clean.head, "failure", "develop is red", timeout=RULE_TIMEOUT)
+    if status.get("target_url") != issue["html_url"]:
+        raise Fail(f"the freeze status links {status.get('target_url')}, not the issue")
+    run.builder.call(
+        "PATCH",
+        f"/repos/{REPO}/pulls/{clean.number}",
+        {"body": f"Fixes #{issue['number']} (no signer Approve)"},
+    )
+    run.hold(clean.head, "failure", "develop is red")
+    wave = run.prs["wave"]
+    run.wait(wave.head, "success", timeout=5)  # a wave PR is not a task PR
+    red_run = log_url.group(1).rsplit("/", 1)[-1].removesuffix(".log")
+
+    def rebuilt() -> bool:
+        out = subprocess.run(["docker", "logs", RUNNER_CONTAINER], capture_output=True, text=True)
+        return f"sandbox rebuilt (after {red_run})" in out.stdout + out.stderr
+
+    wait_for("the sandbox rebuild after the red run", rebuilt, timeout=10 * 60)
+    return (
+        f"red run on {red[:12]} opened #{issue['number']} (merge commit and log linked); #{clean.number} that passed "
+        f"now fails '{status['description']}', also with 'Fixes #{issue['number']}' but no signer Approve; wave PR "
+        "unaffected; sandbox rebuilt after the red run"
+    )
+
+
+def s13_green_run_clears_the_freeze(run: Run) -> str:
+    if run.freeze_issue is None:
+        raise Fail("no freeze issue from scenario 12")
+    clean = run.prs["clean"]
+    makefile = base64.b64decode(kd_api("GET", f"repos/{REPO}/contents/Makefile?ref=develop")["content"]).decode()
+    green = run.put_file(DEVELOP_BRANCH, "Makefile", makefile + GREEN_JOURNEYS)
+    run.develop_heads.append(green)
+    say(f"  {DEVELOP_BRANCH} at {green[:12]}: journeys pass (stands in for the merged fix)")
+
+    def closed() -> dict[str, Any] | None:
+        issue = run.builder.call("GET", f"/repos/{REPO}/issues/{run.freeze_issue}")
+        return issue if issue["state"] == "closed" else None
+
+    issue = wait_for(f"#{run.freeze_issue} to be closed", closed)
+    closer = (issue.get("closed_by") or {}).get("login")
+    if closer != RUNNER_BOT:
+        raise Fail(f"#{run.freeze_issue} was closed by {closer}, not {RUNNER_BOT}")
+    comments = run.builder.call("GET", f"/repos/{REPO}/issues/{run.freeze_issue}/comments", per_page=100)
+    if not any(green[:12] in c["body"] and c["user"]["login"] == RUNNER_BOT for c in comments):
+        raise Fail(f"#{run.freeze_issue} has no runner comment naming the green head {green[:12]}")
+    run.wait(clean.head, "success", timeout=RULE_TIMEOUT)
+    return f"green run on {green[:12]}: {RUNNER_BOT} closed #{run.freeze_issue}; #{clean.number} back to success"
+
+
 def s10_statuses_by_runner(run: Run) -> str:
     total = 0
     for pr in run.prs.values():
@@ -586,15 +889,46 @@ def s10_statuses_by_runner(run: Run) -> str:
 
 SCENARIOS: list[tuple[int, str, Scenario]] = [
     (1, "runner up, log has no secrets", s1_runner_up),
-    (2, "clean PR without review fails on Challenger: first", s2_clean_pr_needs_challenger),
-    (3, "challenger Approve flips to success, no second run", s3_approve_flips_without_rerun),
+    (
+        2,
+        "clean PR without review fails on Challenger: first",
+        s2_clean_pr_needs_challenger,
+    ),
+    (
+        3,
+        "challenger Approve flips to success, no second run",
+        s3_approve_flips_without_rerun,
+    ),
     (4, "new push needs a fresh approval", s4_new_push_needs_fresh_approval),
     (5, "broken test fails on make test, stays failed", s5_broken_test_stays_failed),
-    (6, "protected path (Makefile) needs KD's Approve", s6_protected_path_needs_kd),
-    (7, "trust-critical path needs Challenger: first and second", s7_trust_critical_needs_two),
-    (8, "develop into main needs label, ready, attested Approve", s8_wave_pr_needs_signoff),
+    (6, "protected path (Makefile) needs the signer's Approve", s6_protected_path_needs_kd),
+    (
+        7,
+        "trust-critical path needs Challenger: first and second",
+        s7_trust_critical_needs_two,
+    ),
+    (
+        8,
+        "develop into main needs label, ready, attested Approve",
+        s8_wave_pr_needs_signoff,
+    ),
     (9, "job sees no build key or token", s9_no_secrets_in_job),
-    (10, "every status created by mandate-runner[bot]", s10_statuses_by_runner),
+    (
+        11,
+        "PR code in the sandbox can't reach lab_local services",
+        s11_sandbox_cannot_reach_the_lab,
+    ),
+    (
+        12,
+        "a red develop freezes a task PR that would otherwise pass",
+        s12_red_develop_freezes,
+    ),
+    (13, "a green run clears the freeze", s13_green_run_clears_the_freeze),
+    (
+        10,
+        "every status created by mandate-runner[bot]",
+        s10_statuses_by_runner,
+    ),  # last: covers every head
 ]
 
 
@@ -609,14 +943,46 @@ def open_test_prs(run: Run) -> None:
     ]
     if open_wave:
         raise Fail(f"a develop->main PR is already open (#{open_wave[0]['number']}); close it first")
+    if freeze_issues(run):
+        raise Fail(f"a {FREEZE_LABEL} issue is already open on {REPO}; run with ARGS=--cleanup first")
+    label = subprocess.run(
+        ["gh", "api", f"repos/{REPO}/labels/{FREEZE_LABEL}"],
+        capture_output=True,
+        text=True,
+    )
+    run.had_freeze_label = label.returncode == 0
     doc = f"docs/verify-runner/{run.tag}.md"
     run.task_pr("clean", "clean change", {doc: f"verify-runner-live {run.tag}: clean change\n"})
-    run.task_pr("broken", "broken test", {"tests/unit/test_verify_runner_broken.py": BROKEN_TEST})
+    run.task_pr(
+        "broken",
+        "broken test",
+        {"tests/unit/test_verify_runner_broken.py": BROKEN_TEST},
+    )
     run.task_pr("protected", "protected path (Makefile)", {"Makefile": None})
-    run.task_pr("critical", "trust-critical path", {"tests/unit/test_verify_runner_ledger_probe.py": LEDGER_TEST})
-    run.task_pr("secrets", "secrets probe", {"tests/unit/test_verify_runner_secrets_probe.py": SECRETS_PROBE})
+    run.task_pr(
+        "critical",
+        "trust-critical path",
+        {"tests/unit/test_verify_runner_ledger_probe.py": LEDGER_TEST},
+    )
+    run.task_pr(
+        "secrets",
+        "secrets probe",
+        {"tests/unit/test_verify_runner_secrets_probe.py": SECRETS_PROBE},
+    )
+    run.task_pr(
+        "isolation",
+        "sandbox isolation probe",
+        {"tests/unit/test_verify_runner_isolation_probe.py": isolation_probe()},
+    )
     head = run.develop_sha()
-    run.open_pr("wave", "develop", head, "wave close (develop into main)", base="main", draft=True)
+    run.open_pr(
+        "wave",
+        "develop",
+        head,
+        "wave close (develop into main)",
+        base="main",
+        draft=True,
+    )
 
 
 def cleanup(run: Run | None, builder: App) -> list[str]:
@@ -633,15 +999,32 @@ def cleanup(run: Run | None, builder: App) -> list[str]:
             continue  # never develop or main
         kd_api("DELETE", f"repos/{REPO}/git/refs/heads/{name}")
         done.append(f"deleted branch {name}")
+    for issue in builder.call("GET", f"/repos/{REPO}/issues", state="open", labels=FREEZE_LABEL, per_page=100):
+        if "pull_request" not in issue and issue["user"]["login"] == RUNNER_BOT:
+            builder.call("PATCH", f"/repos/{REPO}/issues/{issue['number']}", {"state": "closed"})
+            done.append(f"closed freeze issue #{issue['number']}")
     if run is not None and run.created_label:
         kd("label", "delete", WAVE_LABEL, "-R", REPO, "--yes")
         done.append(f"deleted label {WAVE_LABEL}")
+    if run is not None and not run.had_freeze_label:
+        if (
+            subprocess.run(
+                ["gh", "label", "delete", FREEZE_LABEL, "-R", REPO, "--yes"],
+                capture_output=True,
+            ).returncode
+            == 0
+        ):
+            done.append(f"deleted label {FREEZE_LABEL} (created by the runner during this run)")
     return done
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--cleanup", action="store_true", help="only close leftover test PRs and delete their branches")
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="only close leftover test PRs and delete their branches",
+    )
     args = parser.parse_args()
 
     if kd("api", "user", "--jq", ".login").strip() != KD:
@@ -652,7 +1035,11 @@ def main() -> int:
             say(line)
         return 0
 
-    run = Run(tag=datetime.now(UTC).strftime("%Y%m%d-%H%M%S"), builder=builder, challenger=challenger)
+    run = Run(
+        tag=datetime.now(UTC).strftime("%Y%m%d-%H%M%S"),
+        builder=builder,
+        challenger=challenger,
+    )
     results: list[tuple[int, str, bool, str]] = []
     say(f"verify-runner-live {run.tag} against {REPO}")
     try:

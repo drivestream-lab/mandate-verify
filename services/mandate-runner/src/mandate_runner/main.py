@@ -5,11 +5,15 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
 
 from . import config as config_mod
+from . import deployer as deployer_mod
+from . import proxy as proxy_mod
+from .deployer import DeployerClient
 from .executor import DockerSandboxExecutor
 from .github import GitHubApp
 from .logserver import serve
@@ -32,9 +36,17 @@ def verify_identities(gh: GitHubApp, cfg: config_mod.Config) -> None:
         raise IdentityError(f"App '{cfg.identities.challenger_app_slug}' does not have the configured App ID")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """`runner` (default), `proxy` (the sandbox's egress) or `deployer` (host Docker jobs)."""
     configure_logging()
+    role = (argv if argv is not None else sys.argv[1:] or ["runner"])[0]
+    if role == "proxy":
+        return proxy_mod.main(int(os.environ.get("MANDATE_RUNNER_PROXY_PORT", "3128")))
     cfg = config_mod.load(Path(os.environ.get("MANDATE_RUNNER_CONFIG", "/etc/mandate-runner/runner.toml")))
+    if role == "deployer":
+        return deployer_mod.main(cfg)
+    if role != "runner":
+        raise SystemExit(f"unknown role {role!r}: runner, proxy or deployer")
     creds = load_credentials(Path(os.environ.get("MANDATE_RUNNER_SECRETS_DIR", "/run/secrets/mandate-runner")))
     if creds.app_id != cfg.identities.runner_app_id:
         raise IdentityError("app-id in the secrets folder is not the configured runner App ID")
@@ -43,19 +55,25 @@ def main() -> int:
 
     store = Store(cfg.data_dir)
     test_secrets = os.environ.get("MANDATE_RUNNER_TEST_SECRETS") == "1"
-    executor = DockerSandboxExecutor(cfg, gh.installation_token, test_secrets=test_secrets)
+    jobs_dir = Path(os.environ.get("MANDATE_RUNNER_JOBS_DIR", "/jobs"))
+    executor = DockerSandboxExecutor(
+        cfg, gh.installation_token, test_secrets=test_secrets, deployer=DeployerClient(jobs_dir), jobs_dir=jobs_dir
+    )
     serve(store.logs_dir, "0.0.0.0", int(os.environ.get("MANDATE_RUNNER_LOG_PORT", "8090")))
-    runner = Runner(cfg, gh, executor, store)
+    # GitHub's clock: Docker Desktop's VM clock can lag after the laptop sleeps (PR 4).
+    runner = Runner(cfg, gh, executor, store, clock=gh.now)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     heartbeat = cfg.data_dir / "heartbeat"
+    dr = cfg.develop_run
     log.info(
-        "mandate-runner up: %s every %ss; test secrets %s",
+        "mandate-runner up: %s every %ss; test secrets %s; develop run %s",
         ", ".join(r.name for r in cfg.repos),
         cfg.poll_interval_seconds,
         "on" if test_secrets else "off",
+        f"{dr.repo}@{dr.branch} (deploy {'on' if dr.deploy.enabled else 'off'})" if dr else "off",
     )
     while not stop.is_set():
         started = time.monotonic()
