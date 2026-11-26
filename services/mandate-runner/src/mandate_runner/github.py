@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 from urllib.parse import quote
 
@@ -15,6 +16,7 @@ from .models import PullRequest, Review
 from .secrets import AppCredentials
 
 API = "https://api.github.com"
+SKEW_TOLERANCE = 30.0  # seconds of clock difference before the App JWT is re-timed
 MAX_PR_FILES = 3000  # GitHub's ceiling for the PR files listing
 
 
@@ -40,23 +42,50 @@ class GitHubApp:
         self._lock = threading.Lock()
         self._token: str | None = None
         self._token_expires = 0.0
+        # GitHub's clock minus ours. Docker Desktop's VM clock can lag the host after
+        # the laptop sleeps, which makes GitHub reject the App JWT as not yet valid
+        # or expired.
+        self._skew = 0.0
 
     def __repr__(self) -> str:
         return f"GitHubApp(app_id={self._creds.app_id})"
 
     # --- auth -------------------------------------------------------------
 
+    def _now(self) -> float:
+        return time.time() + self._skew
+
     def _app_jwt(self) -> str:
-        now = int(time.time())
+        now = int(self._now())
         payload = {"iat": now - 60, "exp": now + 540, "iss": str(self._creds.app_id)}
         return jwt.encode(payload, self._creds.private_key, algorithm="RS256")
 
+    def _learn_skew(self, resp: httpx.Response) -> bool:
+        """Takes GitHub's clock from the Date header. True if ours was off enough to matter."""
+        date = resp.headers.get("Date")
+        if not date:
+            return False
+        try:
+            skew = parsedate_to_datetime(date).timestamp() - time.time()
+        except (TypeError, ValueError):
+            return False
+        if abs(skew - self._skew) < SKEW_TOLERANCE:
+            return False
+        self._skew = skew
+        return True
+
+    def _app_call(self, method: str, url: str) -> httpx.Response:
+        """A call authenticated by the App JWT, retried once with GitHub's clock on a 401."""
+        resp = self._client.request(method, url, headers=self._headers(f"Bearer {self._app_jwt()}"))
+        if resp.status_code == 401 and self._learn_skew(resp):
+            resp = self._client.request(method, url, headers=self._headers(f"Bearer {self._app_jwt()}"))
+        return resp
+
     def installation_token(self) -> str:
         with self._lock:
-            if self._token is None or time.time() > self._token_expires - 300:
-                resp = self._client.post(
-                    f"{self._api}/app/installations/{self._creds.installation_id}/access_tokens",
-                    headers=self._headers(f"Bearer {self._app_jwt()}"),
+            if self._token is None or self._now() > self._token_expires - 300:
+                resp = self._app_call(
+                    "POST", f"{self._api}/app/installations/{self._creds.installation_id}/access_tokens"
                 )
                 resp.raise_for_status()
                 body = resp.json()
@@ -64,10 +93,16 @@ class GitHubApp:
                 self._token = token
                 expires = body.get("expires_at", "")
                 self._token_expires = (
-                    calendar.timegm(time.strptime(expires, "%Y-%m-%dT%H:%M:%SZ")) if expires else time.time() + 3000
+                    calendar.timegm(time.strptime(expires, "%Y-%m-%dT%H:%M:%SZ")) if expires else self._now() + 3000
                 )
                 return token
             return self._token
+
+    def _drop_token(self, token: str) -> None:
+        """Forgets a token GitHub refused, unless another thread already replaced it."""
+        with self._lock:
+            if self._token == token:
+                self._token = None
 
     @staticmethod
     def _headers(auth: str, accept: str = "application/vnd.github+json") -> dict[str, str]:
@@ -77,9 +112,15 @@ class GitHubApp:
         self, method: str, path: str, *, accept: str = "application/vnd.github+json", **kw: Any
     ) -> httpx.Response:
         url = path if path.startswith("http") else f"{self._api}{path}"
-        return self._client.request(
-            method, url, headers=self._headers(f"token {self.installation_token()}", accept), **kw
-        )
+        token = self.installation_token()
+        resp = self._client.request(method, url, headers=self._headers(f"token {token}", accept), **kw)
+        if resp.status_code == 401:
+            # The cached token can be stale (revoked, or expired by GitHub's clock while
+            # ours lagged). Mint a fresh one and try once more.
+            self._drop_token(token)
+            token = self.installation_token()
+            resp = self._client.request(method, url, headers=self._headers(f"token {token}", accept), **kw)
+        return resp
 
     def _get_json(self, path: str, **params: Any) -> Any:
         resp = self._request("GET", path, params=params or None)
@@ -101,7 +142,7 @@ class GitHubApp:
     # --- identity checks ---------------------------------------------------
 
     def authenticated_app_id(self) -> int:
-        resp = self._client.get(f"{self._api}/app", headers=self._headers(f"Bearer {self._app_jwt()}"))
+        resp = self._app_call("GET", f"{self._api}/app")
         resp.raise_for_status()
         return int(resp.json()["id"])
 
