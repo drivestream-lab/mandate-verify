@@ -29,7 +29,7 @@ make runner-test    # unit tests, in a container
 
 Code: [services/mandate-runner](services/mandate-runner). Compose: [docker-compose.runner.yml](docker-compose.runner.yml).
 
-**What it runs.** The command set for each base branch comes from [config/mandate-runner/runner.toml](config/mandate-runner/runner.toml), never from the PR. Today it is `make check`, `make test` and `make journeys`, with the full journey set on every graded PR. The runner checks out the exact head commit into a fresh workspace and runs the commands in a job container inside its sandbox. The sandbox is wiped between runs: no containers, networks or volumes are kept.
+**What it runs.** The command set for each base branch comes from [config/mandate-runner/runner.toml](config/mandate-runner/runner.toml), never from the PR. Today it is `make setup`, `make check`, `make test` and `make journeys`, with the full journey set on every graded PR. The runner checks out the exact head commit into a fresh workspace and runs the commands in a job container inside its sandbox. The sandbox is wiped between runs: no containers, networks or volumes are kept.
 
 **When it posts success.** The commands passed and every review rule holds on the current head:
 

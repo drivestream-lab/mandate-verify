@@ -42,12 +42,14 @@ label = "wave-accepted"
 initiative = "INIT-MANDATE-001"
 
 # One command set per base branch. PRs into any other base are not graded.
-# For now every graded PR runs the full journey set.
+# For now every graded PR runs the full journey set. `make setup` comes first: the
+# repos' check and test targets run tools from the .venv it creates, and the sandbox
+# starts empty for every head.
 [bases.develop]
-commands = ["make check", "make test", "make journeys"]
+commands = ["make setup", "make check", "make test", "make journeys"]
 
 [bases.main]
-commands = ["make check", "make test", "make journeys"]
+commands = ["make setup", "make check", "make test", "make journeys"]
 
 # The sandbox (Docker-in-Docker) is rebuilt from scratch with `make runner-reset-sandbox`
 # (run by the deployer): once a day, and after any run that did not pass.
