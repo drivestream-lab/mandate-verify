@@ -51,7 +51,8 @@ WAVE_LABEL = "wave-accepted"
 SECRETS = Path.home() / ".mandate" / "secrets" / "build"
 RUNNER_CONTAINER = "lab-mandate-runner"
 LOG_SERVER = "http://127.0.0.1:8090"
-PREFIX = "verify-runner"
+# Matches the sandbox repos' policy-branch-name check: <prefix>/<slug>, prefix chore.
+PREFIX = "chore/verify-runner-"
 TITLE = "[verify-runner-live]"
 
 RUN_TIMEOUT = 30 * 60  # first run builds the job image and runs make setup
@@ -190,7 +191,7 @@ class Run:
 
     def push_branch(self, key: str, files: dict[str, str | None]) -> tuple[str, str]:
         """Branch from develop with KD's gh; `None` content means append to the existing file."""
-        branch = f"{PREFIX}/{self.tag}-{key}"
+        branch = f"{PREFIX}{self.tag}-{key}"
         kd_api("POST", f"repos/{REPO}/git/refs", ref=f"refs/heads/{branch}", sha=self.develop_sha())
         head = ""
         for path, content in files.items():
@@ -625,10 +626,10 @@ def cleanup(run: Run | None, builder: App) -> list[str]:
         if pr["title"].startswith(TITLE):
             builder.call("PATCH", f"/repos/{REPO}/pulls/{pr['number']}", {"state": "closed"})
             done.append(f"closed #{pr['number']}")
-    refs = kd_api("GET", f"repos/{REPO}/git/matching-refs/heads/{PREFIX}/") or []
+    refs = kd_api("GET", f"repos/{REPO}/git/matching-refs/heads/{PREFIX}") or []
     for ref in refs:
         name = ref["ref"].removeprefix("refs/heads/")
-        if not name.startswith(f"{PREFIX}/"):
+        if not name.startswith(PREFIX):
             continue  # never develop or main
         kd_api("DELETE", f"repos/{REPO}/git/refs/heads/{name}")
         done.append(f"deleted branch {name}")
