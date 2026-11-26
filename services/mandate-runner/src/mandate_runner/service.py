@@ -8,8 +8,8 @@
 - Infrastructure errors are not cached: the head is retried on a later poll.
 
 B0-02, after every merge into develop (develop_run in the config):
-- The merged head is run once: deployed to the lab stack, then every journey.
-  A head with no Dockerfile or no journeys target records "nothing to deploy yet".
+- The merged head is run once: deployed to the lab stack, then `make verify` against it.
+  A head with no Dockerfile or no verify target records "nothing to deploy yet".
 - A red run opens a bug issue on the repo as the runner App, linked to the merge
   commit and the run's log. While one is open, every PR into the task base fails
   with "develop is red" (see freeze.py). A green run closes it, lifting the freeze.
@@ -187,7 +187,7 @@ class Runner:
     def _execute_develop(self, dr: DevelopRun, sha: str, digest: str, run_id: str) -> None:
         runlog = self._store.open_log(run_id)
         runlog.write(f"mandate-runner after a merge into {dr.repo} {dr.branch}: head {sha}")
-        runlog.write("deploy to the lab stack, then (runner config): " + ", ".join(dr.commands))
+        runlog.write("deploy to the lab stack, then against it (runner config): " + ", ".join(dr.commands))
         try:
             result = self._executor.run_develop(dr.repo, sha, dr.commands, run_id, runlog, dr.deploy)
         except Exception as exc:
@@ -197,7 +197,7 @@ class Runner:
             return
         self._store.save_result(dr.repo, sha, digest, result)
         if result.passed:
-            runlog.write(f"develop is green: {result.note or 'deployed and every journey passed'}")
+            runlog.write(f"develop is green: {result.note or 'deployed and make verify passed'}")
         else:
             runlog.write(f"develop is red: {result.failed_command} failed")
             self._rebuild_after_failure(run_id)
@@ -213,7 +213,7 @@ class Runner:
                     dr.repo,
                     issue.number,
                     f"{dr.branch} is green again at [{sha[:12]}]({commit}) "
-                    f"({result.note or 'deployed; every journey passed'}). [Run log]({url}). "
+                    f"({result.note or 'deployed; make verify passed'}). [Run log]({url}). "
                     "Closing this lifts the merge freeze.",
                 )
                 log.info("freeze lifted: closed %s#%d (green at %s)", dr.repo, issue.number, sha[:12])

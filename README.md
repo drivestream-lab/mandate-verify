@@ -21,15 +21,22 @@ It runs as four containers, all from one image except the sandbox:
 | `lab-mandate-runner-proxy` | The sandbox's only way out: HTTP(S) to public addresses on ports 80 and 443 | `mandate_runner_sandbox`, `mandate_runner_egress` | Nothing |
 | `lab-mandate-runner-deployer` | Host Docker jobs the runner asks for: rebuild the sandbox, deploy the merged head | none | The host Docker socket; no key, no PR code |
 
+Like every repo, it has five targets:
+
 ```bash
-make runner-up      # needs ~/.mandate/secrets/build/mandate-runner/{app-id,installation-id,private-key.pem}
-make runner-logs
-make runner-test    # unit tests, in a container
+make setup     # .venv-verify: the live check's packages and ruff
+make check     # format check and lint
+make test      # the runner's unit tests, in a container
+make deploy    # build the runner from this branch and run it in Docker
+               # (needs ~/.mandate/secrets/build/mandate-runner/{app-id,installation-id,private-key.pem})
+make verify    # every journey against the deployed runner (see "Live check")
 ```
+
+Operating it: `make runner-logs`, `make runner-ps`, `make runner-down`, `make runner-reset-sandbox`.
 
 Code: [services/mandate-runner](services/mandate-runner). Compose: [docker-compose.runner.yml](docker-compose.runner.yml).
 
-**What it runs.** The command set for each base branch comes from [config/mandate-runner/runner.toml](config/mandate-runner/runner.toml), never from the PR. Today it is `make setup`, `make check`, `make test` and `make journeys`, with the full journey set on every graded PR. The runner checks out the exact head commit into a fresh workspace and runs the commands in a job container inside its sandbox. The sandbox is wiped between runs: no containers, networks or volumes are kept.
+**What it runs.** The command set for each base branch comes from [config/mandate-runner/runner.toml](config/mandate-runner/runner.toml), never from the PR. It is the five targets every repo has: `make setup`, `make check`, `make test`, `make deploy` and `make verify` (every journey against what deploy started). On a PR they run in the sandbox, against the sandbox's own engine. The swarm's verifier judges verify's output, along with the deployed app's tables and logs. The runner checks out the exact head commit into a fresh workspace and runs the commands in a job container inside its sandbox. The sandbox is wiped between runs: no containers, networks or volumes are kept.
 
 **When it posts success.** The commands passed and every review rule holds on the current head:
 
@@ -59,12 +66,22 @@ Only reviews on the current head count. For each identity, and for each challeng
 
 **A fresh sandbox.** The deployer rebuilds the sandbox from scratch with `make runner-reset-sandbox` once a day, by GitHub's clock (Docker Desktop's clock can lag after sleep), and after any run that did not pass. The runner asks over the `mandate_runner_jobs` volume and waits.
 
-**After every merge into `develop` on `mandate` (B0-02).** The runner checks the merged head out and, in a freshly rebuilt sandbox, builds its image. The deployer loads that image and runs it as `lab-mandate` on `lab_local`, then waits for `/health`. Then every journey runs (`make setup`, `make journeys`). If the head has no `Dockerfile` or no `journeys` target, the run records "nothing to deploy yet" and passes. PR code never touches the host engine: the image is built in the sandbox and handed over as a file.
+**After every merge into `develop` on `mandate` (B0-02).**
+1. The runner checks the merged head out and builds its image in a freshly rebuilt sandbox.
+2. The deployer loads that image and runs it as `lab-mandate` on `lab_local`, with `~/.mandate/lab/mandate.env`. Its entrypoint runs the migrations. Then it waits for `/health`.
+3. The deployer runs `make setup` and `make verify` from the merged head, in a job container on `lab_local`, against the deployed service (`MANDATE_SERVICE_URL`), with the same `.env`. The container gets no Docker engine.
 
-The deployed service reads `~/.mandate/lab/mandate.env` (yours, outside the repos). It must set `POSTGRES_DB=mandate_lab`, its own database on `lab-postgres`, which you create once. Without that file the deploy fails, and develop goes red.
+If the head has no `Dockerfile` or no `verify` target, the run records "nothing to deploy yet" and passes. The repo's own `make deploy` is never run with the host engine: what a Makefile runs there could read the runner's key.
+
+The database is the one dev-infra-lab provisions, `mandate` (roles `mandate_owner` and `mandate_app`), and the env file must name it. It is kept across waves: each deploy migrates it. When waves aren't compatible, the deployer's `purge` job deletes the data and keeps the schema and the migration history, then the next deploy migrates and verify runs again. Without the env file the deploy fails, and develop goes red.
 
 **Merge freeze.** A red develop run opens an issue on `mandate` as `mandate-runner[bot]`, labelled `develop-red`, linking the merge commit and the run log. While it is open, every PR into `develop` (on both repos) fails with "develop is red". The exception is the fix: a PR whose body says `Fixes #N` (from control-tower: `Fixes drivestream-lab/mandate#N`) and that has `nikd10x`'s Approve on its head is graded as usual. When a later develop run is green, the runner closes the issue, which lifts the freeze. Only issues the runner opened count. Wave PRs into `main` aren't frozen.
 
-**Live check.** `make runner-up RUNNER_LOCAL=1` then `make verify-runner-live` runs 13 scenarios against the running runner on `mandate-sandbox-svc`, from [scripts/verify_runner_live.py](scripts/verify_runner_live.py). The gitignored override makes the develop run use a test branch with deploy off, and makes `0xbeefdead` the signer, so the check needs no one. The real config keeps `nikd10x`. `make runner-up` restores the real config.
+**Live check.** `make deploy RUNNER_LOCAL=1` then `make verify` runs every journey of the runner against the running runner, on `mandate-sandbox-svc`, from [scripts/verify_runner_live.py](scripts/verify_runner_live.py). The gitignored override does three things:
+- makes the develop run use a test branch;
+- deploys `mandate-sandbox-svc` as `lab-mandate-verify`, with `~/.mandate/lab/mandate-verify.env` and its reused database `mandate_verify_lab`;
+- makes `0xbeefdead` the signer, so the check needs no one.
+
+The real config keeps `nikd10x`. `make deploy` restores the real config.
 
 **Limits.** PR code controls the sandbox's Docker engine; that's how `make journeys` brings up its own stack. The job image runs by image id, so a PR can't swap it for a later run. A PR that compromises the sandbox engine itself could still affect later runs, though. That is why it is rebuilt daily and after failures, and before every deploy build. The sandbox is a privileged container: PR code that escapes it would reach the Docker Desktop VM, and the network rules above don't hold against that.

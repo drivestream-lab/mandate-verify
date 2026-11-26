@@ -1,5 +1,5 @@
 # mandate-runner (Compose profile `runner`). Engineering-ready PRD PL-16, tasks B0-01 and B0-02.
-# Usage: make runner-up
+# Usage: make deploy
 #
 # Four containers, one image for the three of them that are ours:
 #   mandate-runner           Polls Mandate's repos, posts mandate/build-verified, runs develop
@@ -86,13 +86,15 @@ services:
       MANDATE_RUNNER_JOBS_DIR: /jobs
       # make runner-reset-sandbox runs against the host engine, so it needs this checkout
       # and $HOME at their host paths (set by the Makefile).
-      MANDATE_VERIFY_DIR: ${MANDATE_VERIFY_DIR:?run through make runner-up}
+      MANDATE_VERIFY_DIR: ${MANDATE_VERIFY_DIR:?run through make deploy}
       HOME: ${HOME}
       MANDATE_RUNNER_TEST_SECRETS: ${MANDATE_RUNNER_TEST_SECRETS:-0}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${MANDATE_VERIFY_DIR}:${MANDATE_VERIFY_DIR}:ro
-      - ./config/mandate-runner/runner.toml:/etc/mandate-runner/runner.toml:ro
+      # The config directory, not the file: git replaces files on pull, which would
+      # leave a single-file mount pointing at the old copy.
+      - ./config/mandate-runner:/etc/mandate-runner:ro
       # The deployed Mandate service's settings (KD's, outside the repos): mandate.env.
       - ${HOME}/.mandate/lab:/config:ro
       - mandate_runner_jobs:/jobs
@@ -130,7 +132,7 @@ services:
     volumes:
       # The runner App's key: read-only, this container only.
       - ${HOME}/.mandate/secrets/build/mandate-runner:/run/secrets/mandate-runner:ro
-      - ./config/mandate-runner/runner.toml:/etc/mandate-runner/runner.toml:ro
+      - ./config/mandate-runner:/etc/mandate-runner:ro  # a directory: see the deployer
       - type: volume
         source: mandate_runner_dind_certs
         target: /certs/client

@@ -7,7 +7,17 @@ from pathlib import Path
 
 import pytest
 
-from mandate_runner.deployer import DEPLOY, RESET, Deployer, DeployerClient, DeployerError, deploy_tar, env_database
+from mandate_runner.deployer import (
+    DEPLOY,
+    PURGE,
+    RESET,
+    VERIFY,
+    Deployer,
+    DeployerClient,
+    DeployerError,
+    deploy_tar,
+    env_database,
+)
 from mandate_runner.executor import has_make_target
 
 SHA = "3" * 40
@@ -36,7 +46,7 @@ class FakeDocker:
 @pytest.fixture
 def lab(cfg, tmp_path):
     env = tmp_path / "mandate.env"
-    env.write_text("POSTGRES_HOST=lab-postgres\nPOSTGRES_DB=mandate_lab\nPOSTGRES_PASSWORD=not-logged\n")
+    env.write_text("POSTGRES_HOST=lab-postgres\nPOSTGRES_DB=mandate\nPOSTGRES_PASSWORD=not-logged\n")
     deploy = replace(cfg.develop_run.deploy, env_file=str(env))
     cfg = replace(cfg, develop_run=replace(cfg.develop_run, deploy=deploy))
     jobs = tmp_path / "jobs"
@@ -102,7 +112,7 @@ def test_deploy_refuses_an_env_file_pointing_at_another_database(lab):
     env.write_text("POSTGRES_DB=postgres\n")
     docker = FakeDocker()
     result = make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
-    assert not result.ok and "POSTGRES_DB=mandate_lab" in result.message
+    assert not result.ok and "POSTGRES_DB=mandate" in result.message
     assert docker.calls == []
 
 
@@ -179,3 +189,82 @@ def test_has_make_target(tmp_path, text, found):
 
 def test_has_make_target_without_a_makefile(tmp_path):
     assert not has_make_target(Path(tmp_path / "Makefile"), "journeys")
+
+
+# --- verify and purge -------------------------------------------------------------------
+
+RUN = "drivestream-lab__mandate-" + SHA[:12] + "-20261126T120000000000Z"
+
+
+def test_verify_runs_the_develop_commands_on_the_lab_network_against_the_service(lab):
+    cfg, jobs, env, _ = lab
+    docker = FakeDocker()
+    result = make(cfg, jobs, docker).handle({"job": VERIFY, "sha": SHA, "run_id": RUN})
+    assert result.ok, result.message
+    create = next(c for c in docker.calls if c[:2] == ["docker", "create"])
+    assert ["--network", "lab_local"] == create[create.index("--network") : create.index("--network") + 2]
+    assert ["--env-file", str(env)] == create[create.index("--env-file") : create.index("--env-file") + 2]
+    assert "MANDATE_SERVICE_URL=http://lab-mandate:8000" in create
+    assert ["-w", f"/work/{RUN}"] == create[create.index("-w") : create.index("-w") + 2]
+    assert "/var/run/docker.sock" not in " ".join(create)  # no engine for the merged code
+    execs = [c[-1] for c in docker.calls if c[:2] == ["docker", "exec"]]
+    assert execs == ["make setup", "make verify"]
+    assert docker.calls[-1][:3] == ["docker", "rm", "-f"]  # always removed
+
+
+def test_verify_names_the_failing_command(lab):
+    cfg, jobs, _, _ = lab
+
+    class FailVerify(FakeDocker):
+        def __call__(self, args, timeout):
+            if list(args)[:2] == ["docker", "exec"] and list(args)[-1] == "make verify":
+                self.calls.append(list(args))
+                return 2, "journey failed"
+            return super().__call__(args, timeout)
+
+    result = make(cfg, jobs, FailVerify()).handle({"job": VERIFY, "sha": SHA, "run_id": RUN})
+    assert not result.ok and result.failed_command == "make verify"
+    assert "journey failed" in result.log
+
+
+def test_verify_builds_the_host_job_image_once(lab):
+    cfg, jobs, _, _ = lab
+
+    class NoImage(FakeDocker):
+        def __call__(self, args, timeout):
+            if list(args)[:3] == ["docker", "image", "inspect"]:
+                self.calls.append(list(args))
+                return 1, "no such image"
+            return super().__call__(args, timeout)
+
+    docker = NoImage()
+    assert make(cfg, jobs, docker).handle({"job": VERIFY, "sha": SHA, "run_id": RUN}).ok
+    assert any(c[:2] == ["docker", "build"] for c in docker.calls)
+
+
+@pytest.mark.parametrize("bad", [{"sha": SHA, "run_id": "../x"}, {"sha": SHA}, {"run_id": RUN}])
+def test_verify_rejects_anything_but_a_sha_and_a_run_id(lab, bad):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker()
+    assert not make(cfg, jobs, docker).handle({"job": VERIFY, **bad}).ok
+    assert docker.calls == []
+
+
+def test_purge_deletes_data_and_keeps_schema_and_migrations(lab):
+    cfg, jobs, env, _ = lab
+    docker = FakeDocker()
+    result = make(cfg, jobs, docker).handle({"job": PURGE})
+    assert result.ok and "schema and migrations kept" in result.message
+    (call,) = docker.calls
+    assert ["--network", "lab_local"] == call[call.index("--network") : call.index("--network") + 2]
+    assert ["--env-file", str(env)] == call[call.index("--env-file") : call.index("--env-file") + 2]
+    sql = call[-1]
+    assert "TRUNCATE" in sql and "alembic_version" in sql and "DROP" not in sql.upper()
+
+
+def test_purge_refuses_an_env_file_for_another_database(lab):
+    cfg, jobs, env, _ = lab
+    env.write_text("POSTGRES_DB=paperclip\n")
+    docker = FakeDocker()
+    assert not make(cfg, jobs, docker).handle({"job": PURGE}).ok
+    assert docker.calls == []

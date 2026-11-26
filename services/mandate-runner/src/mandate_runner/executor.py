@@ -51,7 +51,7 @@ class Executor(Protocol):
 
 
 def has_make_target(makefile: Path, target: str) -> bool:
-    """A rule for the target in the Makefile itself (`journeys:` or `journeys::`, not `journeys := x`)."""
+    """A rule for the target in the Makefile itself (`verify:` or `verify::`, not `verify := x`)."""
     try:
         text = makefile.read_text(errors="replace")
     except OSError:
@@ -257,7 +257,7 @@ class DockerSandboxExecutor:
     def run_develop(
         self, repo: str, sha: str, commands: tuple[str, ...], run_id: str, runlog: RunLog, deploy: DeployRules
     ) -> CommandsResult:
-        """Deploy the merged head to the lab stack, then run every journey built so far."""
+        """Deploy the merged head to the lab stack, then `make verify` against it (every journey)."""
         workspace = self._cfg.work_dir / run_id
         try:
             self.reset_sandbox(runlog)
@@ -266,23 +266,38 @@ class DockerSandboxExecutor:
                 what
                 for what, present in (
                     ("Dockerfile", (workspace / "Dockerfile").is_file()),
-                    ("journeys target in the Makefile", has_make_target(workspace / "Makefile", "journeys")),
+                    ("verify target in the Makefile", has_make_target(workspace / "Makefile", "verify")),
                 )
                 if not present
             ]
             if missing:
                 runlog.write(f"{NOTHING_TO_DEPLOY}: the head has no " + " and no ".join(missing))
                 return CommandsResult(passed=True, failed_command=None, run_id=run_id, note=NOTHING_TO_DEPLOY)
-            if deploy.enabled:
-                failed = self._deploy(sha, workspace, runlog)
-                if failed is not None:
-                    return CommandsResult(passed=False, failed_command=failed, run_id=run_id)
-            else:
-                runlog.write("deploy is disabled in the runner config; running the journeys only")
-            container = self._job_container(repo, sha, workspace, run_id, runlog)
-            return self._commands(container, commands, run_id, runlog)
+            if not deploy.enabled:
+                runlog.write("deploy is disabled in the runner config; running the commands in the sandbox only")
+                container = self._job_container(repo, sha, workspace, run_id, runlog)
+                return self._commands(container, commands, run_id, runlog)
+            failed = self._deploy(sha, workspace, runlog)
+            if failed is not None:
+                return CommandsResult(passed=False, failed_command=failed, run_id=run_id)
+            return self._verify_deployed(sha, run_id, commands, runlog)
         finally:
             self._cleanup(run_id, workspace, runlog)
+
+    def _verify_deployed(self, sha: str, run_id: str, commands: tuple[str, ...], runlog: RunLog) -> CommandsResult:
+        """The deployer runs the commands from this checkout, on the lab network, against the service."""
+        assert self._deployer is not None
+        runlog.write("=== verify: " + ", ".join(commands) + " from the merged head, against the deployed service")
+        try:
+            result = self._deployer.verify(sha, run_id, timeout=self._cfg.command_timeout_seconds + 900)
+        except DeployerError as exc:
+            raise InfraError(str(exc)) from None
+        if result.log:
+            runlog.write(result.log)
+        runlog.write(f"=== verify: {result.message}")
+        if result.ok:
+            return CommandsResult(passed=True, failed_command=None, run_id=run_id)
+        return CommandsResult(passed=False, failed_command=result.failed_command or "verify", run_id=run_id)
 
     def _deploy(self, sha: str, workspace: Path, runlog: RunLog) -> str | None:
         """Builds the head's image in a freshly rebuilt sandbox and hands it to the deployer.

@@ -41,7 +41,7 @@ def last_status(gh):
 def test_nothing_to_deploy_yet_passes_and_opens_no_issue(cfg, tmp_path):
     runner, gh, ex = setup(cfg, tmp_path)
     runner.poll_once()
-    assert ex.develop_runs == [(MANDATE, MERGE, ("make setup", "make journeys"))]
+    assert ex.develop_runs == [(MANDATE, MERGE, ("make setup", "make verify"))]
     assert gh.opened == [] and gh.closed == []
     assert last_status(gh)[0] == "success"  # the task PR is not frozen
 
@@ -60,7 +60,7 @@ def test_red_run_opens_one_issue_linked_to_the_merge_and_the_log(cfg, tmp_path):
     assert len(gh.opened) == 1
     repo, title, body, label = gh.opened[0]
     assert repo == MANDATE and label == "develop-red"
-    assert title == f"develop is red at {MERGE[:12]}: make journeys failed"
+    assert title == f"develop is red at {MERGE[:12]}: make verify failed"
     assert f"https://github.com/{MANDATE}/commit/{MERGE}" in body
     assert "http://localhost:8090/runs/" in body
     assert "Fixes #" in body

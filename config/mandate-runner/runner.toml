@@ -42,14 +42,15 @@ label = "wave-accepted"
 initiative = "INIT-MANDATE-001"
 
 # One command set per base branch. PRs into any other base are not graded.
-# For now every graded PR runs the full journey set. `make setup` comes first: the
-# repos' check and test targets run tools from the .venv it creates, and the sandbox
-# starts empty for every head.
+# Every repo has the same five targets: setup (the project's .venv and packages),
+# check, test, deploy (build the branch in Docker and run it with its .env), verify
+# (every journey against what deploy started). A PR runs all five in the sandbox, on
+# the sandbox's own engine; the swarm's verifier then judges verify's output.
 [bases.develop]
-commands = ["make setup", "make check", "make test", "make journeys"]
+commands = ["make setup", "make check", "make test", "make deploy", "make verify"]
 
 [bases.main]
-commands = ["make setup", "make check", "make test", "make journeys"]
+commands = ["make setup", "make check", "make test", "make deploy", "make verify"]
 
 # The sandbox (Docker-in-Docker) is rebuilt from scratch with `make runner-reset-sandbox`
 # (run by the deployer): once a day, and after any run that did not pass.
@@ -58,9 +59,12 @@ rebuild_interval_hours = 24
 rebuild_after_failure = true
 
 # B0-02. After every merge into develop on mandate, the runner checks the merged head
-# out, deploys it to the lab stack as the Mandate service, then runs every journey
-# built so far against the sandbox repos. Until the head has a Dockerfile and a
-# `journeys` Makefile target, the run records "nothing to deploy yet" and passes.
+# out and deploys it to the lab stack as the Mandate service through fixed steps (the
+# image is built in the sandbox; the deployer runs it with the lab .env, migrations
+# included). Then `make setup` and `make verify` run from the merged head, on
+# lab_local, against the deployed service. The repo's own `make deploy` is never run
+# with the host engine. Until the head has a Dockerfile and a `verify` target, the run
+# records "nothing to deploy yet" and passes.
 # A red run opens a bug issue on the repo (as mandate-runner, labelled freeze_label).
 # While one is open, every PR into task_base fails with "develop is red", except a PR
 # whose body says `Fixes #N` (or `drivestream-lab/mandate#N`) and has nikd10x's Approve
@@ -69,7 +73,7 @@ rebuild_after_failure = true
 repo = "drivestream-lab/mandate"
 branch = "develop"
 task_base = "develop"
-commands = ["make setup", "make journeys"]
+commands = ["make setup", "make verify"]
 freeze_label = "develop-red"
 
 [develop_run.deploy]
@@ -77,11 +81,15 @@ enabled = true
 container = "lab-mandate"
 network = "lab_local"
 image_repo = "drivestream-lab/mandate"
-# Inside the deployer: ~/.mandate/lab/mandate.env on the host (KD's, outside the repos).
+# Inside the deployer: ~/.mandate/lab/mandate.env on the host (KD's, outside the repos):
+# the .env the service runs with, also handed to `make verify`.
 env_file = "/config/mandate.env"
-# The env file must point the service at its own database on lab-postgres.
-database = "mandate_lab"
+# The env file must point at the lab's Mandate database (dev-infra-lab provisions it,
+# with the mandate_owner and mandate_app roles). Kept across waves: each deploy runs
+# the migrations; a purge deletes the data and keeps the schema, only on request.
+database = "mandate"
 health_url = "http://localhost:8000/health"
+service_url = "http://lab-mandate:8000"
 
 [[repos]]
 name = "drivestream-lab/mandate"

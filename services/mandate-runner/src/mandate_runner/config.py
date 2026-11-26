@@ -60,7 +60,8 @@ class DeployRules:
     image_repo: str
     env_file: str
     database: str
-    health_url: str
+    health_url: str  # inside the service's container
+    service_url: str  # how `make verify` reaches it on the network
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,7 @@ def _develop_run(table: Any, bases: dict[str, BaseRules]) -> DevelopRun:
         env_file=_get(d, "env_file", str, "develop_run.deploy"),
         database=_get(d, "database", str, "develop_run.deploy"),
         health_url=_get(d, "health_url", str, "develop_run.deploy"),
+        service_url=_get(d, "service_url", str, "develop_run.deploy").rstrip("/"),
     )
     return DevelopRun(
         repo=_get(table, "repo", str, "develop_run"),
