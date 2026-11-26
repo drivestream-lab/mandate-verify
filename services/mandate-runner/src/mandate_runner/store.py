@@ -76,6 +76,25 @@ class Store:
             self._posted_path(repo, sha), {"state": state, "description": description, "target_url": target_url}
         )
 
+    # --- develop runs and the sandbox -------------------------------------------
+
+    def _develop_path(self, repo: str, sha: str) -> Path:
+        return self.root / "develop" / repo_slug(repo) / f"{sha}.json"
+
+    def develop_reported(self, repo: str, sha: str) -> bool:
+        """The freeze issue was already opened, commented or closed for this develop head."""
+        return _read_json(self._develop_path(repo, sha)) is not None
+
+    def save_develop_reported(self, repo: str, sha: str, action: str) -> None:
+        _write_json(self._develop_path(repo, sha), {"action": action})
+
+    def last_rebuild(self) -> float | None:
+        data = _read_json(self.root / "sandbox-rebuilt.json")
+        return float(data["at"]) if data else None
+
+    def save_rebuild(self, at: float) -> None:
+        _write_json(self.root / "sandbox-rebuilt.json", {"at": at})
+
     def log_path(self, run_id: str) -> Path:
         if not RUN_ID.match(run_id):
             raise ValueError("bad run id")
