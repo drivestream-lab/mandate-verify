@@ -11,7 +11,7 @@ def test_real_config_pins_pl16_identities_and_commands(cfg):
     assert cfg.identities.human_signer_login == "nikd10x"
     assert {r.name for r in cfg.repos} == {"drivestream-lab/mandate", "drivestream-lab/mandate-control-tower"}
     for base in ("develop", "main"):
-        assert cfg.bases[base].commands == ("make check", "make test", "make journeys")
+        assert cfg.bases[base].commands == ("make setup", "make check", "make test", "make journeys")
 
 
 def test_real_config_lists_every_pl16_protected_path(cfg):

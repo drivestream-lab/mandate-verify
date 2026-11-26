@@ -161,7 +161,7 @@ def test_unchanged_head_is_not_graded_twice(cfg, gh, tmp_path):
     for _ in range(5):
         runner.poll_once()
     assert len(ex.runs) == 1
-    assert ex.runs[0] == ("drivestream-lab/mandate", HEAD, ("make check", "make test", "make journeys"))
+    assert ex.runs[0] == ("drivestream-lab/mandate", HEAD, ("make setup", "make check", "make test", "make journeys"))
     assert states(gh) == [("aaaa", "success")]
 
 
@@ -264,7 +264,7 @@ def test_run_log_is_kept_and_records_the_status(cfg, gh, tmp_path):
     logs = list((tmp_path / "logs").glob("*.log"))
     assert len(logs) == 1
     text = logs[0].read_text()
-    assert "pinned commands (runner config): make check, make test, make journeys" in text
+    assert "pinned commands (runner config): make setup, make check, make test, make journeys" in text
     assert "posted mandate/build-verified = success" in text
     assert gh.statuses[0][4].endswith("/runs/" + logs[0].name)
 
