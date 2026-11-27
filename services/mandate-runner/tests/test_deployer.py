@@ -254,12 +254,21 @@ def test_purge_deletes_data_and_keeps_schema_and_migrations(lab):
     cfg, jobs, env, _ = lab
     docker = FakeDocker()
     result = make(cfg, jobs, docker).handle({"job": PURGE})
-    assert result.ok and "schema and migrations kept" in result.message
+    assert result.ok and "schema, migrations and ledger kept" in result.message
     (call,) = docker.calls
     assert ["--network", "lab_local"] == call[call.index("--network") : call.index("--network") + 2]
     assert ["--env-file", str(env)] == call[call.index("--env-file") : call.index("--env-file") + 2]
     sql = call[-1]
     assert "TRUNCATE" in sql and "alembic_version" in sql and "DROP" not in sql.upper()
+
+
+def test_purge_never_touches_the_ledger(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker()
+    result = make(cfg, jobs, docker).handle({"job": PURGE})
+    assert result.ok and "ledger kept" in result.message
+    sql = docker.calls[0][-1]
+    assert "'ledger'" in sql.split("NOT IN", 1)[1].split(")", 1)[0]
 
 
 def test_purge_refuses_an_env_file_for_another_database(lab):

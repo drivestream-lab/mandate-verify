@@ -90,7 +90,8 @@ image_repo = "drivestream-lab/mandate"
 env_file = "/config/mandate.env"
 # The env file must point at the lab's Mandate database (dev-infra-lab provisions it,
 # with the mandate_owner and mandate_app roles). Kept across waves: each deploy runs
-# the migrations; a purge deletes the data and keeps the schema, only on request.
+# the migrations; a purge deletes the data and keeps the schema and the decision ledger
+# (append-only, ADR-020), only on request.
 database = "mandate"
 health_url = "http://localhost:8000/health"
 service_url = "http://lab-mandate:8000"

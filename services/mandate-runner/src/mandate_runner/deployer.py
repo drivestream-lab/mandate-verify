@@ -45,11 +45,14 @@ _SHA = re.compile(r"^[0-9a-f]{40}$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 HOST_JOB_IMAGE = "drivestream-lab/mandate-runner-job:host"
 PURGE_IMAGE = "postgres:16-alpine"
-# Every table except the migration history: the schema stays, the data goes.
+# Every table except the migration history and the decision ledger: the schema stays, the
+# data goes. The ledger is append-only even in the lab (ADR-020): it is never purged, and its
+# trigger would refuse the TRUNCATE anyway. If a purged table is ever referenced by the
+# ledger, CASCADE reaches the ledger, the trigger refuses and the whole purge rolls back.
 PURGE_SQL = (
     "DO $$ DECLARE r record; BEGIN "
     "FOR r IN SELECT schemaname, tablename FROM pg_tables "
-    "WHERE schemaname NOT IN ('pg_catalog', 'information_schema') AND tablename <> 'alembic_version' LOOP "
+    "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'ledger') AND tablename <> 'alembic_version' LOOP "
     "EXECUTE format('TRUNCATE TABLE %I.%I RESTART IDENTITY CASCADE', r.schemaname, r.tablename); "
     "END LOOP; END $$;"
 )
@@ -322,7 +325,7 @@ class Deployer:
         )
         if code != 0:
             return JobResult(False, f"purge of {rules.database} failed (exit {code})", out)
-        return JobResult(True, f"purged {rules.database}: data deleted, schema and migrations kept", out)
+        return JobResult(True, f"purged {rules.database}: data deleted, schema, migrations and ledger kept", out)
 
     # --- loop ----------------------------------------------------------------
 
