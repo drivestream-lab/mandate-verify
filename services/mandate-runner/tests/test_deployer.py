@@ -207,6 +207,9 @@ def test_verify_runs_the_develop_commands_on_the_lab_network_against_the_service
     assert "MANDATE_SERVICE_URL=http://lab-mandate:8000" in create
     assert ["-w", f"/work/{RUN}"] == create[create.index("-w") : create.index("-w") + 2]
     assert "/var/run/docker.sock" not in " ".join(create)  # no engine for the merged code
+    # the merged code never gets the owner's migration keys
+    assert "POSTGRES_MIGRATION_USER=" in create and "POSTGRES_MIGRATION_PASSWORD=" in create
+    assert create.index("POSTGRES_MIGRATION_PASSWORD=") > create.index("--env-file")
     execs = [c[-1] for c in docker.calls if c[:2] == ["docker", "exec"]]
     assert execs == ["make setup", "make verify"]
     assert docker.calls[-1][:3] == ["docker", "rm", "-f"]  # always removed
@@ -260,6 +263,17 @@ def test_purge_deletes_data_and_keeps_schema_and_migrations(lab):
     assert ["--env-file", str(env)] == call[call.index("--env-file") : call.index("--env-file") + 2]
     sql = call[-1]
     assert "TRUNCATE" in sql and "alembic_version" in sql and "DROP" not in sql.upper()
+
+
+def test_purge_connects_as_the_owner_and_refuses_without_owner_keys(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker()
+    make(cfg, jobs, docker).handle({"job": PURGE})
+    script = docker.calls[0][-2]
+    assert '-U "$POSTGRES_MIGRATION_USER"' in script
+    assert 'PGPASSWORD="$POSTGRES_MIGRATION_PASSWORD"' in script
+    assert '"$POSTGRES_USER"' not in script
+    assert "exit 3" in script
 
 
 def test_purge_never_touches_the_ledger(lab):

@@ -274,6 +274,9 @@ class Deployer:
         create = [
             "docker", "create", "--name", container, "--network", rules.network,
             "--env-file", str(env_file),
+            # The merged head's code runs here: it gets the service's (app) keys only, never
+            # the owner's migration keys, which are blanked over the env file.
+            "-e", "POSTGRES_MIGRATION_USER=", "-e", "POSTGRES_MIGRATION_PASSWORD=",
             "-e", f"MANDATE_SERVICE_URL={rules.service_url}", "-e", f"MANDATE_RUNNER_HEAD_SHA={sha}", "-e", "CI=1",
             "-v", f"{self._work_volume}:/work", "-w", workspace,
             HOST_JOB_IMAGE, "sleep", "infinity",
@@ -302,9 +305,13 @@ class Deployer:
         env_file, refused = self._env_file(rules)
         if refused is not None or env_file is None:
             return refused or JobResult(False, "no env file")
+        # The purge truncates, which only the owner may do: it connects with the migration
+        # (owner) keys, never the service's (app) keys, and refuses without them.
         script = (
-            'PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -p "${POSTGRES_PORT:-5432}" '
-            '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "$0"'
+            'test -n "$POSTGRES_MIGRATION_USER" && test -n "$POSTGRES_MIGRATION_PASSWORD" '
+            '|| { echo "purge needs POSTGRES_MIGRATION_USER and POSTGRES_MIGRATION_PASSWORD" >&2; exit 3; }; '
+            'PGPASSWORD="$POSTGRES_MIGRATION_PASSWORD" psql -h "$POSTGRES_HOST" -p "${POSTGRES_PORT:-5432}" '
+            '-U "$POSTGRES_MIGRATION_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "$0"'
         )
         code, out = self._run(
             [
