@@ -34,13 +34,11 @@ def _approved(reviews: Iterable[Review], head_sha: str, counts: Callable[[Review
 
 
 def challenger_slot(review: Review, cfg: Config) -> str | None:
-    """'first' or 'second' when the body carries exactly one marker line."""
+    """'first', 'second' or 'signoff' when the body carries exactly one marker line."""
     lines = _lines(review.body)
-    has_first = cfg.markers.first.strip() in lines
-    has_second = cfg.markers.second.strip() in lines
-    if has_first == has_second:
-        return None
-    return "first" if has_first else "second"
+    slots = {"first": cfg.markers.first, "second": cfg.markers.second, "signoff": cfg.markers.signoff}
+    present = [slot for slot, marker in slots.items() if marker.strip() in lines]
+    return present[0] if len(present) == 1 else None
 
 
 def challenger_approved(pr: PullRequest, reviews: Iterable[Review], cfg: Config, slot: str) -> bool:
@@ -49,8 +47,9 @@ def challenger_approved(pr: PullRequest, reviews: Iterable[Review], cfg: Config,
 
 
 def signer_approval(pr: PullRequest, reviews: Iterable[Review], cfg: Config) -> Review | None:
-    login = cfg.identities.human_signer_login
-    return _approved(reviews, pr.head_sha, lambda r: r.login == login)
+    """The wave signoff: the signer App's latest decisive review carrying the signoff marker."""
+    login = cfg.identities.signer_login
+    return _approved(reviews, pr.head_sha, lambda r: r.login == login and challenger_slot(r, cfg) == "signoff")
 
 
 def carries_attestation(review: Review, pr: PullRequest, cfg: Config) -> bool:
@@ -95,11 +94,14 @@ def evaluate(pr: PullRequest, reviews: list[Review], diff: Diff, cfg: Config) ->
             return _fail("wave-ready", "Wave PR is a draft: mark it ready for review")
         approval = signer_approval(pr, reviews, cfg)
         if approval is None:
-            return _fail("wave-signer-approve", f"Wave PR needs an Approve from {ids.human_signer_login} on this head")
+            return _fail(
+                "wave-signer-approve",
+                f"Wave PR needs an Approve from {ids.signer_login} ({cfg.markers.signoff}) on this head",
+            )
         if not carries_attestation(approval, pr, cfg):
             return _fail(
                 "wave-attestation",
-                f"{ids.human_signer_login}'s Approve lacks the attestation "
+                f"{ids.signer_login}'s signoff lacks the attestation "
                 f"(Initiative: {cfg.wave.initiative}, Head: <full head sha>)",
             )
         return Verdict(ok=True, rule="wave", description="Commands passed; wave signoff holds on this head")
@@ -117,10 +119,11 @@ def evaluate(pr: PullRequest, reviews: list[Review], diff: Diff, cfg: Config) ->
             f"({cfg.markers.second}) on this head",
         )
     protected = protected_touch(diff, repo)
-    if protected is not None and signer_approval(pr, reviews, cfg) is None:
+    if protected is not None and not challenger_approved(pr, reviews, cfg, "second"):
         return _fail(
-            "signer-protected-approve",
-            f"{protected} is protected: needs an Approve from {ids.human_signer_login} on this head",
+            "protected-second-approve",
+            f"{protected} is protected: needs a separate {ids.challenger_app_slug} Approve "
+            f"({cfg.markers.second}) on this head",
         )
     return Verdict(ok=True, rule="task", description="Commands passed; review rules hold on this head")
 

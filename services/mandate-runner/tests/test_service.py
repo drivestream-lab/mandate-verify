@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 
 import pytest
-from conftest import HEAD, KD, first, pr, review, second
+from conftest import HEAD, first, pr, second, signoff
 
 from mandate_runner.models import CommandsResult
 from mandate_runner.service import Runner
@@ -208,7 +208,7 @@ def test_review_rules_rechecked_each_poll_without_rerunning(cfg, gh, tmp_path):
 def test_failed_head_stays_failed_until_a_new_push(cfg, gh, tmp_path):
     runner, ex = make(cfg, gh, tmp_path, FakeExecutor(fail_on="make test"))
     runner.poll_once()
-    gh.reviews[7] = [first(), review(KD)]
+    gh.reviews[7] = [first(), second()]
     runner.poll_once()
     assert len(ex.runs) == 1
     assert gh.statuses == [
@@ -275,7 +275,7 @@ def test_run_log_is_kept_and_records_the_status(cfg, gh, tmp_path):
 
 def test_wave_pr_graded_with_the_main_command_set(cfg, gh, tmp_path):
     gh.prs["drivestream-lab/mandate"] = [pr(base="main", head_ref="develop", labels=("wave-accepted",))]
-    gh.reviews[7] = [review(KD, body=f"Initiative: INIT-MANDATE-001\nHead: {HEAD}")]
+    gh.reviews[7] = [signoff(f"Initiative: INIT-MANDATE-001\nHead: {HEAD}")]
     runner, ex = make(cfg, gh, tmp_path)
     runner.poll_once()
     assert ex.runs[0][2] == cfg.bases["main"].commands

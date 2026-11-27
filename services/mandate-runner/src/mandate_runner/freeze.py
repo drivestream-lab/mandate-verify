@@ -3,7 +3,7 @@
 While the runner has an open freeze issue (a red run on develop), every PR into the
 task base fails with "develop is red". The one way through is the fix itself: a PR
 whose body closes the issue (`Fixes #N`, or `owner/repo#N` from another repo) and
-that has the human signer's Approve on its head.
+that has a second, separate challenger Approve (`Challenger: second`) on its head.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from collections.abc import Iterable
 
 from .config import Config
 from .models import Issue, PullRequest, Review, Verdict
-from .rules import signer_approval
+from .rules import challenger_approved
 
 RULE = "develop-red"
 _CLOSES = re.compile(
@@ -44,11 +44,10 @@ def freeze_verdict(pr: PullRequest, reviews: Iterable[Review], issues: list[Issu
         return None
     issue = issues[0]
     ref = f"#{issue.number}" if pr.repo.lower() == issue.repo.lower() else f"{issue.repo}#{issue.number}"
-    if all(closes(pr, i) for i in issues) and signer_approval(pr, list(reviews), cfg) is not None:
+    if all(closes(pr, i) for i in issues) and challenger_approved(pr, list(reviews), cfg, "second"):
         return None
-    signer = cfg.identities.human_signer_login
     return Verdict(
         ok=False,
         rule=RULE,
-        description=f"develop is red ({ref}): only a PR that Fixes {ref} with {signer}'s Approve can merge",
+        description=f"develop is red ({ref}): only a PR that Fixes {ref} with a {cfg.markers.second} Approve can merge",
     )

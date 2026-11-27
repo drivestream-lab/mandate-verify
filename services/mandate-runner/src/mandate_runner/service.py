@@ -229,7 +229,7 @@ class Runner:
             )
             self._store.save_develop_reported(dr.repo, sha, "commented")
             return
-        signer = self._cfg.identities.human_signer_login
+        second = f"a separate {self._cfg.identities.challenger_app_slug} Approve ({self._cfg.markers.second})"
         issue = self._gh.open_issue(
             dr.repo,
             f"develop is red at {sha[:12]}: {what}",
@@ -245,7 +245,7 @@ class Runner:
                     '`mandate/build-verified` with "develop is red".',
                     "",
                     f"**To fix.** Open a PR whose body says `Fixes #<this issue>` (from another repo: "
-                    f"`Fixes {dr.repo}#<this issue>`). It is graded as usual once {signer} approves its head. "
+                    f"`Fixes {dr.repo}#<this issue>`). It is graded as usual once {second} is on its head. "
                     f"After it merges and the next run on `{dr.branch}` is green, the runner closes this issue "
                     "and the freeze is lifted.",
                 ]
