@@ -47,6 +47,9 @@ class FakeDocker:
 def lab(cfg, tmp_path):
     env = tmp_path / "mandate.env"
     env.write_text("POSTGRES_HOST=lab-postgres\nPOSTGRES_DB=mandate\nPOSTGRES_PASSWORD=not-logged\n")
+    (tmp_path / "secrets").mkdir()
+    for name in ("app-password", "owner-password"):
+        (tmp_path / "secrets" / name).write_text("throwaway")
     deploy = replace(cfg.develop_run.deploy, env_file=str(env))
     cfg = replace(cfg, develop_run=replace(cfg.develop_run, deploy=deploy))
     jobs = tmp_path / "jobs"
@@ -58,7 +61,12 @@ def lab(cfg, tmp_path):
 
 def make(cfg, jobs, docker):
     return Deployer(
-        cfg, jobs, reset_command=["make", "-C", "/mv", "runner-reset-sandbox"], run=docker, sleep=lambda s: None
+        cfg,
+        jobs,
+        reset_command=["make", "-C", "/mv", "runner-reset-sandbox"],
+        run=docker,
+        sleep=lambda s: None,
+        lab_host_dir="/host/.mandate/lab",
     )
 
 
@@ -271,7 +279,7 @@ def test_purge_connects_as_the_owner_and_refuses_without_owner_keys(lab):
     make(cfg, jobs, docker).handle({"job": PURGE})
     script = docker.calls[0][-2]
     assert '-U "$POSTGRES_MIGRATION_USER"' in script
-    assert 'PGPASSWORD="$POSTGRES_MIGRATION_PASSWORD"' in script
+    assert 'PGPASSWORD="$(cat /run/mandate/owner-password)"' in script
     assert '"$POSTGRES_USER"' not in script
     assert "exit 3" in script
 
@@ -291,3 +299,31 @@ def test_purge_refuses_an_env_file_for_another_database(lab):
     docker = FakeDocker()
     assert not make(cfg, jobs, docker).handle({"job": PURGE}).ok
     assert docker.calls == []
+
+
+def test_deploy_mounts_the_password_files_read_only_and_runs_as_root(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker()
+    make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
+    run = next(c for c in docker.calls if c[:3] == ["docker", "run", "-d"])
+    assert ["-v", "/host/.mandate/lab/secrets:/run/mandate:ro"] == run[run.index("-v") : run.index("-v") + 2]
+    assert ["--user", "0:0"] == run[run.index("--user") : run.index("--user") + 2]
+
+
+def test_deploy_refuses_without_the_password_files(lab):
+    cfg, jobs, env, _ = lab
+    (env.parent / "secrets" / "owner-password").unlink()
+    docker = FakeDocker()
+    result = make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
+    assert not result.ok and "owner-password" in result.message
+    assert not any(c[:3] == ["docker", "run", "-d"] for c in docker.calls)
+
+
+def test_purge_reads_the_owner_password_file(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker()
+    make(cfg, jobs, docker).handle({"job": PURGE})
+    call = docker.calls[0]
+    assert "/host/.mandate/lab/secrets:/run/mandate:ro" in call
+    assert "cat /run/mandate/owner-password" in call[-2]
+    assert "POSTGRES_MIGRATION_PASSWORD" not in call[-2]
