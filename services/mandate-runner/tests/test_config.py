@@ -104,10 +104,31 @@ def test_config_without_a_wave_command_set_is_refused():
         config_mod.parse(raw)
 
 
-def test_config_with_identical_markers_is_refused():
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("second", "Challenger: first"), ("signoff", "Challenger: first"), ("signoff", " Challenger: second ")],
+)
+def test_config_with_identical_markers_is_refused(key, value):
     raw = _minimal()
-    raw["markers"]["second"] = "Challenger: first"
+    raw["markers"][key] = value
     with pytest.raises(config_mod.ConfigError, match="markers"):
+        config_mod.parse(raw)
+
+
+@pytest.mark.parametrize("key", ["first", "second", "signoff"])
+@pytest.mark.parametrize("value", ["", "   "])
+def test_config_with_an_empty_marker_is_refused(key, value):
+    raw = _minimal()
+    raw["markers"][key] = value
+    with pytest.raises(config_mod.ConfigError, match="empty"):
+        config_mod.parse(raw)
+
+
+@pytest.mark.parametrize("signer", ["nikd10x", "0xbeefdead", "mandate-builder[bot]", "r[bot]"])
+def test_config_with_a_signer_other_than_the_challenger_app_is_refused(signer):
+    raw = _minimal()
+    raw["identities"]["signer_login"] = signer
+    with pytest.raises(config_mod.ConfigError, match="signer_login"):
         config_mod.parse(raw)
 
 

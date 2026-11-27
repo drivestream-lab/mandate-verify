@@ -137,12 +137,17 @@ def parse(raw: dict[str, Any]) -> Config:
         signer_login=_get(ids, "signer_login", str, "identities"),
         runner_login=_get(ids, "runner_login", str, "identities"),
     )
+    # PL-16 BP-10: the wave signer is the challenger App, never a person.
+    if identities.signer_login != identities.challenger_login:
+        raise ConfigError("identities: signer_login must be the challenger App (challenger_login), never a person")
     m = _get(raw, "markers", dict, "config")
     markers = Markers(
         first=_get(m, "first", str, "markers"),
         second=_get(m, "second", str, "markers"),
         signoff=_get(m, "signoff", str, "markers"),
     )
+    if not all((markers.first.strip(), markers.second.strip(), markers.signoff.strip())):
+        raise ConfigError("markers: first, second and signoff must not be empty")
     if len({markers.first.strip(), markers.second.strip(), markers.signoff.strip()}) != 3:
         raise ConfigError("markers: first, second and signoff must all differ")
     w = _get(raw, "wave", dict, "config")

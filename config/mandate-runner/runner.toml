@@ -38,7 +38,7 @@ first = "Challenger: first"
 second = "Challenger: second"
 signoff = "Signoff: wave"
 
-# A wave PR: develop into main, signed by the human signer.
+# A wave PR: develop into main, signed by the signer App (signoff marker plus attestation).
 [wave]
 base_branch = "main"
 head_branch = "develop"

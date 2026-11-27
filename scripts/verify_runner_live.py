@@ -809,7 +809,7 @@ def s12_red_develop_freezes(run: Run) -> str:
     run.builder.call(
         "PATCH",
         f"/repos/{REPO}/pulls/{clean.number}",
-        {"body": f"Fixes #{issue['number']} (no signer Approve)"},
+        {"body": f"Fixes #{issue['number']} (no Challenger: second Approve)"},
     )
     run.hold(clean.head, "failure", "develop is red")
     wave = run.prs["wave"]
@@ -823,7 +823,7 @@ def s12_red_develop_freezes(run: Run) -> str:
     wait_for("the sandbox rebuild after the red run", rebuilt, timeout=10 * 60)
     return (
         f"red run on {red[:12]} opened #{issue['number']} (merge commit and log linked); #{clean.number} that passed "
-        f"now fails '{status['description']}', also with 'Fixes #{issue['number']}' but no signer Approve; wave PR "
+        f"now fails '{status['description']}', also with 'Fixes #{issue['number']}' but no Challenger: second Approve; wave PR "
         "unaffected; sandbox rebuilt after the red run"
     )
 
@@ -952,7 +952,7 @@ SCENARIOS: list[tuple[int, str, Scenario]] = [
     ),
     (4, "new push needs a fresh approval", s4_new_push_needs_fresh_approval),
     (5, "broken test fails on make test, stays failed", s5_broken_test_stays_failed),
-    (6, "protected path (Makefile) needs the signer's Approve", s6_protected_path_needs_a_second_challenger),
+    (6, "protected path (Makefile) needs a second challenger Approve", s6_protected_path_needs_a_second_challenger),
     (
         7,
         "trust-critical path needs Challenger: first and second",
