@@ -251,16 +251,30 @@ class Deployer:
         if code != 0 or not loaded:
             return JobResult(False, f"docker load failed (exit {code})", out)
         image = f"{rules.image_repo}:{sha[:12]}"
+        volume = f"{rules.container}-secrets"
         steps: list[tuple[list[str], str]] = [
             (["docker", "tag", loaded[-1], image], "docker tag"),
             (["docker", "rm", "-f", rules.container], "remove the previous service"),
+            # A bind mount does not keep file modes on Docker Desktop (any user can read
+            # it), so the files are installed into a volume with enforced modes: the
+            # owner's root-only 0600, the app's 0644. Reinstalled on every deploy.
+            (["docker", "volume", "rm", "-f", volume], "remove the previous password volume"),
+            (["docker", "volume", "create", volume], "create the password volume"),
+            (
+                [
+                    "docker", "run", "--rm", *mount, "-v", f"{volume}:/dst", PURGE_IMAGE, "sh", "-c",
+                    f"install -m 0644 -o 0 -g 0 {SECRETS_MOUNT}/app-password /dst/app-password && "
+                    f"install -m 0600 -o 0 -g 0 {SECRETS_MOUNT}/owner-password /dst/owner-password",
+                ],
+                "install the password files",
+            ),
             (
                 [
                     "docker", "run", "-d", "--name", rules.container, "--network", rules.network,
                     "--env-file", str(env_file), "--restart", "unless-stopped",
                     # Root only to read the owner's file for the migration; the entrypoint
                     # then drops to the app user, which cannot read it.
-                    "--user", "0:0", *mount,
+                    "--user", "0:0", "-v", f"{volume}:{SECRETS_MOUNT}:ro",
                     "--label", f"mandate.head={sha}", image,
                 ],
                 "docker run",

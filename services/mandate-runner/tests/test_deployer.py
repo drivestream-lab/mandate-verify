@@ -91,12 +91,15 @@ def test_deploy_loads_the_image_and_runs_the_service_on_the_lab_network(lab):
     assert docker.calls[0] == ["docker", "load", "-i", str(tar)]
     assert docker.calls[1] == ["docker", "tag", f"mandate-deploy:{SHA}", f"drivestream-lab/mandate:{SHA[:12]}"]
     assert docker.calls[2] == ["docker", "rm", "-f", "lab-mandate"]
-    run = docker.calls[3]
+    assert docker.calls[3] == ["docker", "volume", "rm", "-f", "lab-mandate-secrets"]
+    assert docker.calls[4] == ["docker", "volume", "create", "lab-mandate-secrets"]
+    assert docker.calls[5][:3] == ["docker", "run", "--rm"]
+    run = docker.calls[6]
     assert run[:3] == ["docker", "run", "-d"]
     assert ["--network", "lab_local"] == run[run.index("--network") : run.index("--network") + 2]
     assert ["--env-file", str(env)] == run[run.index("--env-file") : run.index("--env-file") + 2]
     assert f"mandate.head={SHA}" in run
-    assert docker.calls[4] == ["docker", "exec", "lab-mandate", "curl", "-fsS", "http://localhost:8000/health"]
+    assert docker.calls[7] == ["docker", "exec", "lab-mandate", "curl", "-fsS", "http://localhost:8000/health"]
     assert not tar.exists()  # loaded, then removed
 
 
@@ -126,8 +129,14 @@ def test_deploy_refuses_an_env_file_pointing_at_another_database(lab):
 
 def test_deploy_failing_step_is_named(lab):
     cfg, jobs, _, _ = lab
-    result = make(cfg, jobs, FakeDocker(fail="docker run")).handle({"job": DEPLOY, "sha": SHA})
+    result = make(cfg, jobs, FakeDocker(fail="docker run -d")).handle({"job": DEPLOY, "sha": SHA})
     assert not result.ok and result.message.startswith("docker run failed")
+
+
+def test_deploy_names_a_failed_password_install(lab):
+    cfg, jobs, _, _ = lab
+    result = make(cfg, jobs, FakeDocker(fail="install -m")).handle({"job": DEPLOY, "sha": SHA})
+    assert not result.ok and result.message.startswith("install the password files failed")
 
 
 @pytest.mark.parametrize("request_", [{"job": DEPLOY, "sha": "../../etc"}, {"job": DEPLOY}, {"job": "rm -rf"}, {}])
@@ -301,13 +310,18 @@ def test_purge_refuses_an_env_file_for_another_database(lab):
     assert docker.calls == []
 
 
-def test_deploy_mounts_the_password_files_read_only_and_runs_as_root(lab):
+def test_deploy_installs_the_password_files_into_a_volume_and_runs_as_root(lab):
     cfg, jobs, _, _ = lab
     docker = FakeDocker()
     make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
+    install = next(c for c in docker.calls if c[:3] == ["docker", "run", "--rm"])
+    assert "/host/.mandate/lab/secrets:/run/mandate:ro" in install
+    assert "install -m 0600 -o 0 -g 0" in install[-1] and "install -m 0644" in install[-1]
     run = next(c for c in docker.calls if c[:3] == ["docker", "run", "-d"])
-    assert ["-v", "/host/.mandate/lab/secrets:/run/mandate:ro"] == run[run.index("-v") : run.index("-v") + 2]
+    volume = run[run.index("-v") + 1]
+    assert volume.endswith("-secrets:/run/mandate:ro") and not volume.startswith("/")
     assert ["--user", "0:0"] == run[run.index("--user") : run.index("--user") + 2]
+    assert docker.calls.index(install) < docker.calls.index(run)
 
 
 def test_deploy_refuses_without_the_password_files(lab):
