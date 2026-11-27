@@ -207,6 +207,9 @@ def test_verify_runs_the_develop_commands_on_the_lab_network_against_the_service
     assert "MANDATE_SERVICE_URL=http://lab-mandate:8000" in create
     assert ["-w", f"/work/{RUN}"] == create[create.index("-w") : create.index("-w") + 2]
     assert "/var/run/docker.sock" not in " ".join(create)  # no engine for the merged code
+    # the merged code never gets the owner's migration keys
+    assert "POSTGRES_MIGRATION_USER=" in create and "POSTGRES_MIGRATION_PASSWORD=" in create
+    assert create.index("POSTGRES_MIGRATION_PASSWORD=") > create.index("--env-file")
     execs = [c[-1] for c in docker.calls if c[:2] == ["docker", "exec"]]
     assert execs == ["make setup", "make verify"]
     assert docker.calls[-1][:3] == ["docker", "rm", "-f"]  # always removed

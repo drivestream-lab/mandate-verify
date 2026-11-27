@@ -274,6 +274,9 @@ class Deployer:
         create = [
             "docker", "create", "--name", container, "--network", rules.network,
             "--env-file", str(env_file),
+            # The merged head's code runs here: it gets the service's (app) keys only, never
+            # the owner's migration keys, which are blanked over the env file.
+            "-e", "POSTGRES_MIGRATION_USER=", "-e", "POSTGRES_MIGRATION_PASSWORD=",
             "-e", f"MANDATE_SERVICE_URL={rules.service_url}", "-e", f"MANDATE_RUNNER_HEAD_SHA={sha}", "-e", "CI=1",
             "-v", f"{self._work_volume}:/work", "-w", workspace,
             HOST_JOB_IMAGE, "sleep", "infinity",
