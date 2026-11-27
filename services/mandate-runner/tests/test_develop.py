@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from conftest import HEAD, KD, review
+from conftest import HEAD, second
 from test_service import FakeExecutor, FakeGitHub, InlinePool
 
 from mandate_runner.models import Issue
@@ -75,12 +75,12 @@ def test_red_develop_freezes_a_task_pr_that_would_otherwise_pass(cfg, tmp_path):
     assert url == gh.issues[0].url
 
 
-def test_signed_fix_pr_is_graded_as_usual_while_frozen(cfg, tmp_path):
+def test_fix_pr_with_a_second_approve_is_graded_as_usual_while_frozen(cfg, tmp_path):
     runner, gh, ex = setup(cfg, tmp_path, "red")
     runner.poll_once()
     issue = gh.issues[0]
     gh.prs[MANDATE] = [replace(gh.prs[MANDATE][0], body=f"Fixes #{issue.number}")]
-    gh.reviews[7] = [*gh.reviews[7], review(KD, "APPROVED", "ok", HEAD)]
+    gh.reviews[7] = [*gh.reviews[7], second(commit=HEAD)]
     runner.poll_once()
     assert last_status(gh)[:2] == ("success", "Commands passed; review rules hold on this head")
 
@@ -111,7 +111,7 @@ def test_still_red_at_a_new_head_comments_instead_of_opening_another(cfg, tmp_pa
 def test_issue_closed_by_hand_is_not_reopened_for_the_same_head(cfg, tmp_path):
     runner, gh, ex = setup(cfg, tmp_path, "red")
     runner.poll_once()
-    gh.issues = []  # KD closed it
+    gh.issues = []  # closed by hand
     runner.poll_once()
     assert len(gh.opened) == 1
     assert last_status(gh)[0] == "success"

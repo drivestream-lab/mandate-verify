@@ -18,7 +18,8 @@ class Identities:
     challenger_app_slug: str
     challenger_app_id: int
     challenger_login: str
-    human_signer_login: str
+    # Signs wave PRs (develop into main). A GitHub App, never a person (KD, 27 Nov 2026).
+    signer_login: str
     runner_login: str
 
 
@@ -26,6 +27,7 @@ class Identities:
 class Markers:
     first: str
     second: str
+    signoff: str
 
 
 @dataclass(frozen=True)
@@ -132,13 +134,17 @@ def parse(raw: dict[str, Any]) -> Config:
         challenger_app_slug=_get(ids, "challenger_app_slug", str, "identities"),
         challenger_app_id=_get(ids, "challenger_app_id", int, "identities"),
         challenger_login=_get(ids, "challenger_login", str, "identities"),
-        human_signer_login=_get(ids, "human_signer_login", str, "identities"),
+        signer_login=_get(ids, "signer_login", str, "identities"),
         runner_login=_get(ids, "runner_login", str, "identities"),
     )
     m = _get(raw, "markers", dict, "config")
-    markers = Markers(first=_get(m, "first", str, "markers"), second=_get(m, "second", str, "markers"))
-    if markers.first.strip() == markers.second.strip():
-        raise ConfigError("markers: first and second must differ")
+    markers = Markers(
+        first=_get(m, "first", str, "markers"),
+        second=_get(m, "second", str, "markers"),
+        signoff=_get(m, "signoff", str, "markers"),
+    )
+    if len({markers.first.strip(), markers.second.strip(), markers.signoff.strip()}) != 3:
+        raise ConfigError("markers: first, second and signoff must all differ")
     w = _get(raw, "wave", dict, "config")
     wave = WaveRules(
         base_branch=_get(w, "base_branch", str, "wave"),

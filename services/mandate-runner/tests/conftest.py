@@ -11,7 +11,7 @@ from mandate_runner.models import Diff, PullRequest, Review
 HEAD = "a" * 40
 OLD = "b" * 40
 CHALLENGER = "mandate-challenger[bot]"
-KD = "nikd10x"
+KD = "nikd10x"  # a person: no review of theirs counts for any rule
 
 
 def config_path() -> Path:
@@ -72,3 +72,8 @@ def second(state: str = "APPROVED", commit: str = HEAD) -> Review:
 
 def diff(*paths: str, tool_changed: bool = False) -> Diff:
     return Diff(paths=tuple(paths), pyproject_tool_changed=tool_changed)
+
+
+def signoff(body: str = "", state: str = "APPROVED", commit: str = HEAD, login: str = CHALLENGER) -> Review:
+    """The wave signer's review (the challenger App), with the signoff marker."""
+    return review(login, state, f"Evidence checked on the deployed head.\nSignoff: wave\n{body}", commit)

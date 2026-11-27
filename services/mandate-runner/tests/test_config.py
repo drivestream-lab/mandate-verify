@@ -8,7 +8,8 @@ def test_real_config_pins_pl16_identities_and_commands(cfg):
     assert cfg.status_context == "mandate/build-verified"
     assert cfg.identities.runner_app_id == 5860839
     assert cfg.identities.challenger_app_id == 5860827
-    assert cfg.identities.human_signer_login == "nikd10x"
+    assert cfg.identities.signer_login == "mandate-challenger[bot]"
+    assert cfg.markers.signoff == "Signoff: wave"
     assert {r.name for r in cfg.repos} == {"drivestream-lab/mandate", "drivestream-lab/mandate-control-tower"}
     for base in ("develop", "main"):
         assert cfg.bases[base].commands == ("make setup", "make check", "make test", "make deploy", "make verify")
@@ -34,8 +35,8 @@ def _minimal() -> dict:
         "poll_interval_seconds": 30, "status_context": "x", "log_base_url": "http://l", "data_dir": "/d",
         "work_dir": "/w", "job_image_tag": "j", "job_image_context": "/c", "command_timeout_seconds": 60,
         "identities": {"runner_app_id": 1, "challenger_app_slug": "c", "challenger_app_id": 2,
-                       "challenger_login": "c[bot]", "human_signer_login": "kd", "runner_login": "r[bot]"},
-        "markers": {"first": "Challenger: first", "second": "Challenger: second"},
+                       "challenger_login": "c[bot]", "signer_login": "c[bot]", "runner_login": "r[bot]"},
+        "markers": {"first": "Challenger: first", "second": "Challenger: second", "signoff": "Signoff: wave"},
         "wave": {"base_branch": "main", "head_branch": "develop", "label": "wave-accepted", "initiative": "I"},
         "bases": {"main": {"commands": ["make test"]}},
         "repos": [{"name": "o/r", "protected_paths": [], "pyproject_tool_settings_protected": True,

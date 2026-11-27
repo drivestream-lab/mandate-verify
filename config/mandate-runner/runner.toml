@@ -25,14 +25,18 @@ runner_app_id = 5860839
 challenger_app_slug = "mandate-challenger"
 challenger_app_id = 5860827
 challenger_login = "mandate-challenger[bot]"
-human_signer_login = "nikd10x"
+# The wave signer: an App, never a person (KD, 27 Nov 2026: no gh users in the flow).
+signer_login = "mandate-challenger[bot]"
 runner_login = "mandate-runner[bot]"
 
 # A challenger review counts for a slot only when its body carries exactly one of
-# these lines. Trust-critical paths need both, on separate reviews of the head.
+# these lines. Trust-critical paths, protected paths and the fix for a red develop
+# need first and second, on separate reviews of the head. A wave PR needs the
+# signer's signoff review, after the verifier checked the deployed evidence.
 [markers]
 first = "Challenger: first"
 second = "Challenger: second"
+signoff = "Signoff: wave"
 
 # A wave PR: develop into main, signed by the human signer.
 [wave]
@@ -67,8 +71,8 @@ rebuild_after_failure = true
 # records "nothing to deploy yet" and passes.
 # A red run opens a bug issue on the repo (as mandate-runner, labelled freeze_label).
 # While one is open, every PR into task_base fails with "develop is red", except a PR
-# whose body says `Fixes #N` (or `drivestream-lab/mandate#N`) and has nikd10x's Approve
-# on its head. The runner closes the issue after a green run, which lifts the freeze.
+# whose body says `Fixes #N` (or `drivestream-lab/mandate#N`) and has a second, separate
+# challenger Approve (Challenger: second) on its head. The runner closes the issue after a green run, which lifts the freeze.
 [develop_run]
 repo = "drivestream-lab/mandate"
 branch = "develop"
@@ -93,7 +97,7 @@ service_url = "http://lab-mandate:8000"
 
 [[repos]]
 name = "drivestream-lab/mandate"
-# PL-16 BP-6. A PR touching any of these needs an Approve from the human signer.
+# PL-16 BP-6. A PR touching any of these needs a second, separate challenger Approve.
 protected_paths = [
   "CLAUDE.md",
   ".claude/agents/**",
