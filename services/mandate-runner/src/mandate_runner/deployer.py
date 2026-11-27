@@ -302,9 +302,13 @@ class Deployer:
         env_file, refused = self._env_file(rules)
         if refused is not None or env_file is None:
             return refused or JobResult(False, "no env file")
+        # The purge truncates, which only the owner may do: it connects with the migration
+        # (owner) keys, never the service's (app) keys, and refuses without them.
         script = (
-            'PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -p "${POSTGRES_PORT:-5432}" '
-            '-U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "$0"'
+            'test -n "$POSTGRES_MIGRATION_USER" && test -n "$POSTGRES_MIGRATION_PASSWORD" '
+            '|| { echo "purge needs POSTGRES_MIGRATION_USER and POSTGRES_MIGRATION_PASSWORD" >&2; exit 3; }; '
+            'PGPASSWORD="$POSTGRES_MIGRATION_PASSWORD" psql -h "$POSTGRES_HOST" -p "${POSTGRES_PORT:-5432}" '
+            '-U "$POSTGRES_MIGRATION_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "$0"'
         )
         code, out = self._run(
             [

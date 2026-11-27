@@ -262,6 +262,17 @@ def test_purge_deletes_data_and_keeps_schema_and_migrations(lab):
     assert "TRUNCATE" in sql and "alembic_version" in sql and "DROP" not in sql.upper()
 
 
+def test_purge_connects_as_the_owner_and_refuses_without_owner_keys(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker()
+    make(cfg, jobs, docker).handle({"job": PURGE})
+    script = docker.calls[0][-2]
+    assert '-U "$POSTGRES_MIGRATION_USER"' in script
+    assert 'PGPASSWORD="$POSTGRES_MIGRATION_PASSWORD"' in script
+    assert '"$POSTGRES_USER"' not in script
+    assert "exit 3" in script
+
+
 def test_purge_never_touches_the_ledger(lab):
     cfg, jobs, _, _ = lab
     docker = FakeDocker()
