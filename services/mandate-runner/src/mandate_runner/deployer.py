@@ -45,6 +45,10 @@ _SHA = re.compile(r"^[0-9a-f]{40}$")
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 HOST_JOB_IMAGE = "drivestream-lab/mandate-runner-job:host"
 PURGE_IMAGE = "postgres:16-alpine"
+# The lab database password files (ADR-019), in ~/.mandate/lab/secrets/, mounted read-only.
+SECRETS_DIR = "secrets"
+SECRET_FILES = ("app-password", "owner-password")
+SECRETS_MOUNT = "/run/mandate"
 # Every table except the migration history and the decision ledger: the schema stays, the
 # data goes. The ledger is append-only even in the lab (ADR-020): it is never purged, and its
 # trigger would refuse the TRUNCATE anyway. If a purged table is ever referenced by the
@@ -164,9 +168,13 @@ class Deployer:
         job_image_context: str = "/app/job-image",
         run: Run = _run,
         sleep: Callable[[float], None] = time.sleep,
+        lab_host_dir: str | None = None,
     ):
         self._cfg = cfg
         self._dir = jobs_dir
+        # ~/.mandate/lab at its HOST path: docker run -v needs the host side, while the
+        # deployer itself sees the same folder at the env file's directory (/config).
+        self._lab_host_dir = lab_host_dir or os.path.join(os.environ.get("HOME", ""), ".mandate", "lab")
         self._reset_command = tuple(reset_command)
         self._work_volume = work_volume
         self._job_image_context = job_image_context
@@ -212,6 +220,17 @@ class Deployer:
             return JobResult(False, f"sandbox reset failed (exit {code})", out)
         return JobResult(True, "sandbox rebuilt", out)
 
+    def _secrets(self, env_file: Path) -> tuple[list[str], JobResult | None]:
+        """The read-only mount of the lab's database password files (ADR-019), or why not."""
+        here = env_file.parent / SECRETS_DIR
+        missing = [name for name in SECRET_FILES if not (here / name).is_file()]
+        if missing:
+            return [], JobResult(
+                False, f"the lab password files are missing: {', '.join(missing)} (~/.mandate/lab/{SECRETS_DIR}/)"
+            )
+        host = os.path.join(self._lab_host_dir, SECRETS_DIR)
+        return ["-v", f"{host}:{SECRETS_MOUNT}:ro"], None
+
     def deploy(self, rules: DeployRules, sha: str) -> JobResult:
         tar = deploy_tar(self._dir, sha)
         if not tar.is_file():
@@ -220,6 +239,10 @@ class Deployer:
         if refused is not None or env_file is None:
             tar.unlink(missing_ok=True)
             return refused or JobResult(False, "no env file")
+        mount, refused = self._secrets(env_file)
+        if refused is not None:
+            tar.unlink(missing_ok=True)
+            return refused
         try:
             code, out = self._run(["docker", "load", "-i", str(tar)], 600)
         finally:
@@ -235,6 +258,9 @@ class Deployer:
                 [
                     "docker", "run", "-d", "--name", rules.container, "--network", rules.network,
                     "--env-file", str(env_file), "--restart", "unless-stopped",
+                    # Root only to read the owner's file for the migration; the entrypoint
+                    # then drops to the app user, which cannot read it.
+                    "--user", "0:0", *mount,
                     "--label", f"mandate.head={sha}", image,
                 ],
                 "docker run",
@@ -305,13 +331,17 @@ class Deployer:
         env_file, refused = self._env_file(rules)
         if refused is not None or env_file is None:
             return refused or JobResult(False, "no env file")
-        # The purge truncates, which only the owner may do: it connects with the migration
-        # (owner) keys, never the service's (app) keys, and refuses without them.
+        mount, refused = self._secrets(env_file)
+        if refused is not None:
+            return refused
+        # The purge truncates, which only the owner may do: it connects as the migration
+        # (owner) user with the owner's password file, never the service's, and refuses
+        # without them.
         script = (
-            'test -n "$POSTGRES_MIGRATION_USER" && test -n "$POSTGRES_MIGRATION_PASSWORD" '
-            '|| { echo "purge needs POSTGRES_MIGRATION_USER and POSTGRES_MIGRATION_PASSWORD" >&2; exit 3; }; '
-            'PGPASSWORD="$POSTGRES_MIGRATION_PASSWORD" psql -h "$POSTGRES_HOST" -p "${POSTGRES_PORT:-5432}" '
-            '-U "$POSTGRES_MIGRATION_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "$0"'
+            'test -n "$POSTGRES_MIGRATION_USER" && test -r ' + SECRETS_MOUNT + "/owner-password "
+            '|| { echo "purge needs POSTGRES_MIGRATION_USER and the owner password file" >&2; exit 3; }; '
+            'PGPASSWORD="$(cat ' + SECRETS_MOUNT + '/owner-password)" psql -h "$POSTGRES_HOST" '
+            '-p "${POSTGRES_PORT:-5432}" -U "$POSTGRES_MIGRATION_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "$0"'
         )
         code, out = self._run(
             [
@@ -322,6 +352,7 @@ class Deployer:
                 rules.network,
                 "--env-file",
                 str(env_file),
+                *mount,
                 PURGE_IMAGE,
                 "sh",
                 "-c",
