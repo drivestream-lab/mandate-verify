@@ -103,7 +103,12 @@ jobs:
           CHECKOUT="$GITHUB_WORKSPACE"
           VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
           # The process baseline comes before the first venv or pip call.
-          /bin/ps -eo pid= | tr -d ' ' | sort > "$RUNNER_TEMP/pids-before.txt"
+          for dir in /proc/[0-9]*; do
+            stat=$(/bin/cat "$dir/stat" 2> /dev/null) || continue
+            rest=${stat##*) }
+            set -- $rest
+            echo "${dir#/proc/}:${20}"
+          done | sort > "$RUNNER_TEMP/pids-before.txt"
           # The baseline is kept in a root-owned, read-only copy that later steps read.
           sudo install -d -m 0755 -o root -g root /var/lib/verify-baseline
           sudo install -m 0444 -o root -g root "$RUNNER_TEMP/pids-before.txt" /var/lib/verify-baseline/pids-before.txt
@@ -273,30 +278,43 @@ jobs:
               "$PYBIN" -I -S -B -X pycache_prefix="$pycache" "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
           }
           new_processes() {
-            # Processes that are not in the baseline, minus this shell's own helpers. Kernel threads are
-            # not survivors: PID 2 (kthreadd) itself, and a child of PID 2 whose /proc/<pid>/exe cannot be
-            # read. systemd-timedated, started on demand by D-Bus, is the one service excepted, and only
-            # when it is exactly the system service: parent PID 1, cgroup exactly
-            # 0::/system.slice/systemd-timedated.service, exe /usr/lib/systemd/systemd-timedated, uid 0.
+            # Processes that are not in the baseline (matched by PID and start time, so a recycled PID is
+            # not ignored), minus this shell's own helpers. Kernel threads are not survivors: PID 2
+            # (kthreadd) itself, and a child of PID 2 whose /proc/<pid>/exe cannot be read.
+            # systemd-timedated, started on demand by D-Bus, is the one service excepted, only when it
+            # is exactly the system service as an unprivileged reader can tell: parent PID 1, cgroup
+            # exactly 0::/system.slice/systemd-timedated.service, owned by root.
             local me=$BASHPID
-            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$me -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
+            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$me -v top=$$ '$1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
               [[ "$pid" == 2 ]] && continue
               if [[ "$ppid" == 2 ]] && ! /usr/bin/readlink "/proc/$pid/exe" > /dev/null 2>&1; then continue; fi
               if [[ "$ppid" == 1 && "$(/bin/cat "/proc/$pid/cgroup" 2> /dev/null)" == "0::/system.slice/systemd-timedated.service" \
-                && "$(/usr/bin/readlink "/proc/$pid/exe" 2> /dev/null)" == /usr/lib/systemd/systemd-timedated \
                 && "$(/usr/bin/stat -c %u "/proc/$pid" 2> /dev/null)" == 0 ]]; then continue; fi
+              if stat=$(/bin/cat "/proc/$pid/stat" 2> /dev/null); then
+                rest=${stat##*) }
+                set -- $rest
+                /bin/grep -qxF "$pid:${20}" /var/lib/verify-baseline/pids-before.txt && continue
+              else
+                # gone before it could be read: it only counts if it was not in the baseline by PID
+                /bin/grep -q "^$pid:" /var/lib/verify-baseline/pids-before.txt && continue
+              fi
               echo "$pid $comm"
             done
           }
-          # Two snapshots about a second apart: a process that hops from PID to PID (fork, parent
-          # exits, repeat) always shows at least one new process in each, a one-off transient does not.
+          # Three snapshots about a second apart: a process that hops from PID to PID (fork, parent
+          # exits, repeat) shows at least one new process in every one of them, an unrelated transient
+          # does not.
           survivors() {
-            local first second
+            local first second third
             /bin/sleep 1
             first=$(new_processes)
             /bin/sleep 1
             second=$(new_processes)
-            if [[ -n "$first" && -n "$second" ]]; then printf '%s\n%s\n' "$first" "$second" | /usr/bin/sort -u; fi
+            /bin/sleep 1
+            third=$(new_processes)
+            if [[ -n "$first" && -n "$second" && -n "$third" ]]; then
+              printf '%s\n%s\n%s\n' "$first" "$second" "$third" | /usr/bin/sort -u
+            fi
           }
           # pytest and every plugin must resolve inside the pinned tools, never the checkout,
           # and no sitecustomize or usercustomize may resolve anywhere.
@@ -370,30 +388,43 @@ jobs:
         run: |
           set -euo pipefail
           new_processes() {
-            # Processes that are not in the baseline, minus this shell's own helpers. Kernel threads are
-            # not survivors: PID 2 (kthreadd) itself, and a child of PID 2 whose /proc/<pid>/exe cannot be
-            # read. systemd-timedated, started on demand by D-Bus, is the one service excepted, and only
-            # when it is exactly the system service: parent PID 1, cgroup exactly
-            # 0::/system.slice/systemd-timedated.service, exe /usr/lib/systemd/systemd-timedated, uid 0.
+            # Processes that are not in the baseline (matched by PID and start time, so a recycled PID is
+            # not ignored), minus this shell's own helpers. Kernel threads are not survivors: PID 2
+            # (kthreadd) itself, and a child of PID 2 whose /proc/<pid>/exe cannot be read.
+            # systemd-timedated, started on demand by D-Bus, is the one service excepted, only when it
+            # is exactly the system service as an unprivileged reader can tell: parent PID 1, cgroup
+            # exactly 0::/system.slice/systemd-timedated.service, owned by root.
             local me=$BASHPID
-            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$me -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
+            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$me -v top=$$ '$1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
               [[ "$pid" == 2 ]] && continue
               if [[ "$ppid" == 2 ]] && ! /usr/bin/readlink "/proc/$pid/exe" > /dev/null 2>&1; then continue; fi
               if [[ "$ppid" == 1 && "$(/bin/cat "/proc/$pid/cgroup" 2> /dev/null)" == "0::/system.slice/systemd-timedated.service" \
-                && "$(/usr/bin/readlink "/proc/$pid/exe" 2> /dev/null)" == /usr/lib/systemd/systemd-timedated \
                 && "$(/usr/bin/stat -c %u "/proc/$pid" 2> /dev/null)" == 0 ]]; then continue; fi
+              if stat=$(/bin/cat "/proc/$pid/stat" 2> /dev/null); then
+                rest=${stat##*) }
+                set -- $rest
+                /bin/grep -qxF "$pid:${20}" /var/lib/verify-baseline/pids-before.txt && continue
+              else
+                # gone before it could be read: it only counts if it was not in the baseline by PID
+                /bin/grep -q "^$pid:" /var/lib/verify-baseline/pids-before.txt && continue
+              fi
               echo "$pid $comm"
             done
           }
-          # Two snapshots about a second apart: a process that hops from PID to PID (fork, parent
-          # exits, repeat) always shows at least one new process in each, a one-off transient does not.
+          # Three snapshots about a second apart: a process that hops from PID to PID (fork, parent
+          # exits, repeat) shows at least one new process in every one of them, an unrelated transient
+          # does not.
           survivors() {
-            local first second
+            local first second third
             /bin/sleep 1
             first=$(new_processes)
             /bin/sleep 1
             second=$(new_processes)
-            if [[ -n "$first" && -n "$second" ]]; then printf '%s\n%s\n' "$first" "$second" | /usr/bin/sort -u; fi
+            /bin/sleep 1
+            third=$(new_processes)
+            if [[ -n "$first" && -n "$second" && -n "$third" ]]; then
+              printf '%s\n%s\n%s\n' "$first" "$second" "$third" | /usr/bin/sort -u
+            fi
           }
           s=$(survivors)
           [[ -z "$s" ]] || { echo "a process is still running before the upload: $s"; exit 1; }
