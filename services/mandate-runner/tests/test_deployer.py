@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mandate_runner.deployer import (
+    COLLECTOR_CONFIG,
     COLLECTOR_IMAGE,
     DEPLOY,
     PURGE,
@@ -369,6 +370,36 @@ def test_deploy_removes_the_previous_collector_with_the_previous_service(lab):
     docker = FakeDocker(fail="rm -f lab-mandate-otel-collector")
     result = make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
     assert not result.ok and result.message.startswith("remove the previous collector failed")
+
+
+def test_deploy_refuses_a_missing_collector_config_before_any_docker_call(lab, tmp_path):
+    cfg, jobs, _, tar = lab
+    docker = FakeDocker()
+    deployer = Deployer(
+        cfg, jobs, reset_command=["true"], run=docker, sleep=lambda s: None,
+        lab_host_dir="/host/.mandate/lab", collector_config=str(tmp_path / "nope.yaml"),
+    )  # fmt: skip
+    result = deployer.handle({"job": DEPLOY, "sha": SHA})
+    assert not result.ok and "the collector config is missing" in result.message
+    assert docker.calls == []
+    assert not tar.exists()
+
+
+def test_deploy_finds_the_collector_config_in_the_mandate_verify_checkout(lab, tmp_path, monkeypatch):
+    cfg, jobs, _, _ = lab
+    checkout = tmp_path / "checkout"
+    config = checkout / COLLECTOR_CONFIG
+    config.parent.mkdir(parents=True)
+    config.write_text("receivers: {}\n")
+    monkeypatch.setenv("MANDATE_VERIFY_DIR", str(checkout))
+    docker = FakeDocker()
+    deployer = Deployer(
+        cfg, jobs, reset_command=["true"], run=docker, sleep=lambda s: None, lab_host_dir="/host/.mandate/lab"
+    )
+    result = deployer.handle({"job": DEPLOY, "sha": SHA})
+    assert result.ok, result.message
+    collector = next(c for c in docker.calls if c[:3] == ["docker", "run", "-d"] and "lab-mandate-otel-collector" in c)
+    assert f"{config}:/etc/otelcol/config.yaml:ro" in collector
 
 
 def test_purge_reads_the_owner_password_file(lab):
