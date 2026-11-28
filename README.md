@@ -8,6 +8,32 @@ This repo holds verification for both of Mandate's modes (PL-16, BP-2):
 | Governed programmes | The reusable verify workflow: build the exact commit, run the protected test set, attest the evidence bundle | [.github/workflows/verify.yml](.github/workflows/verify.yml) |
 | Build mode (Mandate built by its swarm) | `mandate-runner`: grades the swarm's PRs and posts `mandate/build-verified` | [services/mandate-runner](services/mandate-runner) |
 
+## The evidence bundle (governed programmes)
+
+`verify.yml` has two jobs. `test` has `contents: read` only. It never runs a Makefile or any script of the target repo. The workflow itself builds the environment: Python 3.12.8 (`setup-python`), a venv outside the checkout, the commit's `poetry.lock` installed with its hashes (`--require-hashes --only-binary=:all: --no-deps`; a package that is not from an index, or has no wheel, fails the run), then pytest 8.3.5 (and pytest-asyncio 0.26.0 when requested) with their hashes into a separate `tools` directory that comes first on `PYTHONPATH`. The checkout is added last on the import path (a `.pth` file), so it shadows nothing. pytest runs as `python -P -m pytest` from an empty environment (`env -i`, so no `PYTEST_*`, no earlier `GITHUB_ENV` values), with a trusted config (`-c`, `-o addopts=`, `--rootdir`, `--confcutdir`, `--import-mode=importlib`, no cache provider, plugin autoload off). Before the run, `pytest`, `_pytest` and every plugin are resolved under `-P` and must lie inside `tools`, never the checkout. After collection and after the run, any process the step started that is still alive fails the job. Only then are the raw outputs uploaded.
+
+`attest` is the only job with `id-token` and `attestations: write`, and it runs no code from the target repo. It recomputes the digests from git objects, derives the result from the raw junit and collected ids, tars only the files it wrote, attests `evidence.tgz`, uploads it as `evidence-<commit>-<run_attempt>`, and fails the workflow unless the result is `pass`.
+
+Inputs: `commit` (`^[0-9a-f]{40}$`), `test-set` (space-separated plain relative tracked paths, passed after `--`; empty, leading `-`, `=`, `..`, absolute paths and globs are rejected), `quarantine` (node ids, each with `::`, each exactly one collected test and not contained in another; the count is recorded) and `plugins` (allowlist: `pytest_asyncio` only). `poetry.lock` and `pyproject.toml` must be tracked.
+
+Bundle files (all in `evidence.tgz`, each hashed in `binding.json`): `binding.json`, `report.json`, `environment.json`, `junit.xml`, `collected.txt`, `digest-inputs.txt`.
+
+`binding.json` carries: `repository` (the caller), `commit`, `caller_sha`, `workflow_ref`, `event_name`, `run_id`, `run_attempt`, `test_set`, `test_set_digest`, `dependencies_digest`, `collected_digest`, `quarantine`, `plugins`, `python`, `pytest`, `pytest_asyncio`, `worktree_clean_advisory`, `result`, `artifacts` (sha256 per file).
+
+**Result.** `pass` only when pytest exit and collection exit are 0, there is at least one `<testcase>`, no testcase has a `failure` or `error`, none is skipped (a skipped test is not a pass; quarantined tests are deselected and listed in the quarantine), the testsuite attributes are non-negative integers that equal what the testcases show, and the multiset of junit (classname, name) equals the collected ids minus the quarantine. Counts come from the `<testcase>` elements.
+
+**Test-set digest format.** Computed from git objects at `commit`, never the working tree. Inputs: every tracked blob under a `test-set` path; the `conftest.py` at the root and in every directory above a `test-set` path (a tracked `conftest.py` in the test-set directories is already included); and one `plugin:<name>` line per requested plugin. File lines are `<sha256 hex of the blob content>`, two spaces, `<path>`, newline, sorted by path bytes. Plugin lines follow, sorted, as `plugin:<name>` plus newline. Only modes 100644 and 100755 are allowed. The digest is the sha256 hex of that exact text, which is `digest-inputs.txt`. Project configuration (`pyproject.toml`, `pytest.ini` and so on) is not in it: the workflow's own config is used. Test helpers outside the `test-set` paths are not covered, so declare the whole test root as the test set.
+
+**`dependencies_digest`.** sha256 hex of the text `<sha256 of poetry.lock blob>  poetry.lock\n<sha256 of pyproject.toml blob>  pyproject.toml\n`, from git objects. A dependency bump changes it, not the test-set digest.
+
+**`collected_digest`.** sha256 hex of the sorted collected node ids, each followed by a newline, so Mandate can compare the collected set with the one fixed at sign-off (minus the quarantine).
+
+**`worktree_clean_advisory`** is advisory: it comes from the test job, where the tests ran, so Mandate does not gate on it.
+
+**Environment manifest.** Runner image, OS, Python, every installed package. Service versions and seeded data are deferred until a target needs services (decision pending with KD).
+
+**Accepted risk.** The test code and the application code it imports run on the test runner with the raw outputs in reach, so they can misreport: patch pytest in process, rewrite junit or the exit code, or start a process that does. The workflow does not run the target's build scripts, resolves pytest outside the checkout and fails on surviving processes, but it cannot make code that runs on the runner honest. The backstops are that such code is in the PR diff, which challengers read, and that the protected test paths need a second challenger. It cannot forge a signature: the test job holds no OIDC token and the attest job never runs repo code.
+
 ## mandate-runner
 
 Builds Mandate's swarm, wave B0, tasks B0-01 and B0-02 (Mandate engineering-ready PRD PL-16). This is plain Python, with no model. Every 30 seconds it polls open PRs on `drivestream-lab/mandate` and `drivestream-lab/mandate-control-tower`. For each PR head into `develop` or `main` it posts the commit status `mandate/build-verified`.
