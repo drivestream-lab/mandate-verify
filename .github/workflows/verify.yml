@@ -278,7 +278,8 @@ jobs:
             # read. systemd-timedated, started on demand by D-Bus, is the one service excepted, and only
             # when it is exactly the system service: parent PID 1, cgroup exactly
             # 0::/system.slice/systemd-timedated.service, exe /usr/lib/systemd/systemd-timedated, uid 0.
-            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$BASHPID -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
+            local me=$BASHPID
+            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$me -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
               [[ "$pid" == 2 ]] && continue
               if [[ "$ppid" == 2 ]] && ! /usr/bin/readlink "/proc/$pid/exe" > /dev/null 2>&1; then continue; fi
               if [[ "$ppid" == 1 && "$(/bin/cat "/proc/$pid/cgroup" 2> /dev/null)" == "0::/system.slice/systemd-timedated.service" \
@@ -374,7 +375,8 @@ jobs:
             # read. systemd-timedated, started on demand by D-Bus, is the one service excepted, and only
             # when it is exactly the system service: parent PID 1, cgroup exactly
             # 0::/system.slice/systemd-timedated.service, exe /usr/lib/systemd/systemd-timedated, uid 0.
-            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$BASHPID -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
+            local me=$BASHPID
+            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$me -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
               [[ "$pid" == 2 ]] && continue
               if [[ "$ppid" == 2 ]] && ! /usr/bin/readlink "/proc/$pid/exe" > /dev/null 2>&1; then continue; fi
               if [[ "$ppid" == 1 && "$(/bin/cat "/proc/$pid/cgroup" 2> /dev/null)" == "0::/system.slice/systemd-timedated.service" \
