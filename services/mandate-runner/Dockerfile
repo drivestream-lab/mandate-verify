@@ -19,6 +19,7 @@ COPY src ./src
 FROM base AS test
 RUN pip install --no-cache-dir ".[test]"
 COPY tests ./tests
+COPY collector ./collector
 COPY --from=config runner.toml /etc/mandate-runner/runner.toml
 CMD ["python", "-m", "pytest", "-q"]
 

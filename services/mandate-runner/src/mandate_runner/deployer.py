@@ -60,6 +60,12 @@ PURGE_SQL = (
     "EXECUTE format('TRUNCATE TABLE %I.%I RESTART IDENTITY CASCADE', r.schemaname, r.tablename); "
     "END LOOP; END $$;"
 )
+# The lab's OpenTelemetry collector, beside the service (the pin matches Mandate's own deploy
+# compose). Its config ships in this repo, next to the runner, and is mounted read-only.
+COLLECTOR_IMAGE = "otel/opentelemetry-collector:0.116.1"
+COLLECTOR_CONFIG = "services/mandate-runner/collector/config.yaml"
+COLLECTOR_MOUNT = "/etc/otelcol/config.yaml"
+COLLECTOR_PORT = 4318
 _LOADED = re.compile(r"^Loaded image(?: ID)?: (\S+)$", re.MULTILINE)
 
 
@@ -169,12 +175,18 @@ class Deployer:
         run: Run = _run,
         sleep: Callable[[float], None] = time.sleep,
         lab_host_dir: str | None = None,
+        collector_config: str | None = None,
     ):
         self._cfg = cfg
         self._dir = jobs_dir
         # ~/.mandate/lab at its HOST path: docker run -v needs the host side, while the
         # deployer itself sees the same folder at the env file's directory (/config).
         self._lab_host_dir = lab_host_dir or os.path.join(os.environ.get("HOME", ""), ".mandate", "lab")
+        # The mandate-verify checkout is mounted at its host path in this container, so the
+        # same path serves for the check here and for docker run -v on the host engine.
+        self._collector_config = collector_config or os.path.join(
+            os.environ.get("MANDATE_VERIFY_DIR", ""), COLLECTOR_CONFIG
+        )
         self._reset_command = tuple(reset_command)
         self._work_volume = work_volume
         self._job_image_context = job_image_context
@@ -243,6 +255,9 @@ class Deployer:
         if refused is not None:
             tar.unlink(missing_ok=True)
             return refused
+        if not Path(self._collector_config).is_file():
+            tar.unlink(missing_ok=True)
+            return JobResult(False, f"the collector config is missing ({COLLECTOR_CONFIG})")
         try:
             code, out = self._run(["docker", "load", "-i", str(tar)], 600)
         finally:
@@ -252,9 +267,11 @@ class Deployer:
             return JobResult(False, f"docker load failed (exit {code})", out)
         image = f"{rules.image_repo}:{sha[:12]}"
         volume = f"{rules.container}-secrets"
+        collector = f"{rules.container}-otel-collector"
         steps: list[tuple[list[str], str]] = [
             (["docker", "tag", loaded[-1], image], "docker tag"),
             (["docker", "rm", "-f", rules.container], "remove the previous service"),
+            (["docker", "rm", "-f", collector], "remove the previous collector"),
             # A bind mount does not keep file modes on Docker Desktop (any user can read
             # it), so the files are installed into a volume with enforced modes: the
             # owner's root-only 0600, the app's 0644. Reinstalled on every deploy.
@@ -270,8 +287,17 @@ class Deployer:
             ),
             (
                 [
+                    "docker", "run", "-d", "--name", collector, "--network", rules.network,
+                    "--restart", "unless-stopped", "-v", f"{self._collector_config}:{COLLECTOR_MOUNT}:ro",
+                    COLLECTOR_IMAGE, f"--config={COLLECTOR_MOUNT}",
+                ],
+                "start the collector",
+            ),
+            (
+                [
                     "docker", "run", "-d", "--name", rules.container, "--network", rules.network,
                     "--env-file", str(env_file), "--restart", "unless-stopped",
+                    "-e", f"OTEL_EXPORTER_OTLP_ENDPOINT=http://{collector}:{COLLECTOR_PORT}",
                     # Root only to read the owner's file for the migration; the entrypoint
                     # then drops to the app user, which cannot read it.
                     "--user", "0:0", "-v", f"{volume}:{SECRETS_MOUNT}:ro",

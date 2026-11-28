@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from mandate_runner.deployer import (
+    COLLECTOR_CONFIG,
+    COLLECTOR_IMAGE,
     DEPLOY,
     PURGE,
     RESET,
@@ -21,6 +23,7 @@ from mandate_runner.deployer import (
 from mandate_runner.executor import has_make_target
 
 SHA = "3" * 40
+COLLECTOR_CONFIG_FILE = Path(__file__).parents[1] / "collector" / "config.yaml"
 
 
 class FakeDocker:
@@ -60,6 +63,7 @@ def lab(cfg, tmp_path):
 
 
 def make(cfg, jobs, docker):
+    collector_config = COLLECTOR_CONFIG_FILE
     return Deployer(
         cfg,
         jobs,
@@ -67,6 +71,7 @@ def make(cfg, jobs, docker):
         run=docker,
         sleep=lambda s: None,
         lab_host_dir="/host/.mandate/lab",
+        collector_config=str(collector_config),
     )
 
 
@@ -91,15 +96,17 @@ def test_deploy_loads_the_image_and_runs_the_service_on_the_lab_network(lab):
     assert docker.calls[0] == ["docker", "load", "-i", str(tar)]
     assert docker.calls[1] == ["docker", "tag", f"mandate-deploy:{SHA}", f"drivestream-lab/mandate:{SHA[:12]}"]
     assert docker.calls[2] == ["docker", "rm", "-f", "lab-mandate"]
-    assert docker.calls[3] == ["docker", "volume", "rm", "-f", "lab-mandate-secrets"]
-    assert docker.calls[4] == ["docker", "volume", "create", "lab-mandate-secrets"]
-    assert docker.calls[5][:3] == ["docker", "run", "--rm"]
-    run = docker.calls[6]
+    assert docker.calls[3] == ["docker", "rm", "-f", "lab-mandate-otel-collector"]
+    assert docker.calls[4] == ["docker", "volume", "rm", "-f", "lab-mandate-secrets"]
+    assert docker.calls[5] == ["docker", "volume", "create", "lab-mandate-secrets"]
+    assert docker.calls[6][:3] == ["docker", "run", "--rm"]
+    assert docker.calls[7][:5] == ["docker", "run", "-d", "--name", "lab-mandate-otel-collector"]
+    run = docker.calls[8]
     assert run[:3] == ["docker", "run", "-d"]
     assert ["--network", "lab_local"] == run[run.index("--network") : run.index("--network") + 2]
     assert ["--env-file", str(env)] == run[run.index("--env-file") : run.index("--env-file") + 2]
     assert f"mandate.head={SHA}" in run
-    assert docker.calls[7] == ["docker", "exec", "lab-mandate", "curl", "-fsS", "http://localhost:8000/health"]
+    assert docker.calls[9] == ["docker", "exec", "lab-mandate", "curl", "-fsS", "http://localhost:8000/health"]
     assert not tar.exists()  # loaded, then removed
 
 
@@ -129,7 +136,7 @@ def test_deploy_refuses_an_env_file_pointing_at_another_database(lab):
 
 def test_deploy_failing_step_is_named(lab):
     cfg, jobs, _, _ = lab
-    result = make(cfg, jobs, FakeDocker(fail="docker run -d")).handle({"job": DEPLOY, "sha": SHA})
+    result = make(cfg, jobs, FakeDocker(fail="--name lab-mandate --network")).handle({"job": DEPLOY, "sha": SHA})
     assert not result.ok and result.message.startswith("docker run failed")
 
 
@@ -317,7 +324,7 @@ def test_deploy_installs_the_password_files_into_a_volume_and_runs_as_root(lab):
     install = next(c for c in docker.calls if c[:3] == ["docker", "run", "--rm"])
     assert "/host/.mandate/lab/secrets:/run/mandate:ro" in install
     assert "install -m 0600 -o 0 -g 0" in install[-1] and "install -m 0644" in install[-1]
-    run = next(c for c in docker.calls if c[:3] == ["docker", "run", "-d"])
+    run = next(c for c in docker.calls if c[:3] == ["docker", "run", "-d"] and "lab-mandate" in c)
     volume = run[run.index("-v") + 1]
     assert volume.endswith("-secrets:/run/mandate:ro") and not volume.startswith("/")
     assert ["--user", "0:0"] == run[run.index("--user") : run.index("--user") + 2]
@@ -331,6 +338,68 @@ def test_deploy_refuses_without_the_password_files(lab):
     result = make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
     assert not result.ok and "owner-password" in result.message
     assert not any(c[:3] == ["docker", "run", "-d"] for c in docker.calls)
+
+
+def test_deploy_starts_the_collector_before_the_service_and_points_the_service_at_it(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker()
+    make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
+    runs = [c for c in docker.calls if c[:3] == ["docker", "run", "-d"]]
+    collector, service = runs
+    assert collector[collector.index("--name") + 1] == "lab-mandate-otel-collector"
+    assert ["--network", "lab_local"] == collector[collector.index("--network") : collector.index("--network") + 2]
+    assert ["--restart", "unless-stopped"] == collector[collector.index("--restart") : collector.index("--restart") + 2]
+    assert COLLECTOR_IMAGE == "otel/opentelemetry-collector:0.116.1"
+    assert collector[-2:] == [COLLECTOR_IMAGE, "--config=/etc/otelcol/config.yaml"]
+    assert f"{COLLECTOR_CONFIG_FILE}:/etc/otelcol/config.yaml:ro" in collector
+    assert ["-e", "OTEL_EXPORTER_OTLP_ENDPOINT=http://lab-mandate-otel-collector:4318"] == service[
+        service.index("-e") : service.index("-e") + 2
+    ]
+
+
+def test_deploy_names_a_failed_collector_start_and_does_not_start_the_service(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker(fail=COLLECTOR_IMAGE)
+    result = make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
+    assert not result.ok and result.message.startswith("start the collector failed")
+    assert not any(c[:4] == ["docker", "run", "-d", "--name"] and "lab-mandate" in c[4:5] for c in docker.calls)
+
+
+def test_deploy_removes_the_previous_collector_with_the_previous_service(lab):
+    cfg, jobs, _, _ = lab
+    docker = FakeDocker(fail="rm -f lab-mandate-otel-collector")
+    result = make(cfg, jobs, docker).handle({"job": DEPLOY, "sha": SHA})
+    assert not result.ok and result.message.startswith("remove the previous collector failed")
+
+
+def test_deploy_refuses_a_missing_collector_config_before_any_docker_call(lab, tmp_path):
+    cfg, jobs, _, tar = lab
+    docker = FakeDocker()
+    deployer = Deployer(
+        cfg, jobs, reset_command=["true"], run=docker, sleep=lambda s: None,
+        lab_host_dir="/host/.mandate/lab", collector_config=str(tmp_path / "nope.yaml"),
+    )  # fmt: skip
+    result = deployer.handle({"job": DEPLOY, "sha": SHA})
+    assert not result.ok and "the collector config is missing" in result.message
+    assert docker.calls == []
+    assert not tar.exists()
+
+
+def test_deploy_finds_the_collector_config_in_the_mandate_verify_checkout(lab, tmp_path, monkeypatch):
+    cfg, jobs, _, _ = lab
+    checkout = tmp_path / "checkout"
+    config = checkout / COLLECTOR_CONFIG
+    config.parent.mkdir(parents=True)
+    config.write_text("receivers: {}\n")
+    monkeypatch.setenv("MANDATE_VERIFY_DIR", str(checkout))
+    docker = FakeDocker()
+    deployer = Deployer(
+        cfg, jobs, reset_command=["true"], run=docker, sleep=lambda s: None, lab_host_dir="/host/.mandate/lab"
+    )
+    result = deployer.handle({"job": DEPLOY, "sha": SHA})
+    assert result.ok, result.message
+    collector = next(c for c in docker.calls if c[:3] == ["docker", "run", "-d"] and "lab-mandate-otel-collector" in c)
+    assert f"{config}:/etc/otelcol/config.yaml:ro" in collector
 
 
 def test_purge_reads_the_owner_password_file(lab):

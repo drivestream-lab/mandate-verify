@@ -1,0 +1,19 @@
+# The lab's OpenTelemetry collector: receives the Mandate service's OTLP traces and metrics
+# over HTTP and writes them to its own logs until a real backend exists. Same content as
+# Mandate's docker/otel-collector/config.yaml; the deployer mounts it read-only.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug]
