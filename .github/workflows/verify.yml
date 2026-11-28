@@ -148,8 +148,8 @@ jobs:
               bad = []
               for name, mod in list(sys.modules.items()):
                   path = getattr(mod, "__file__", None)
-                  if not path:
-                      continue
+                  if not path or name in ("__main__", "__mp_main__"):
+                      continue  # the bootstrap itself
                   real = os.path.realpath(path)
                   if not any(real == r or real.startswith(r + os.sep) for r in roots):
                       bad.append(f"{name} -> {real}")
