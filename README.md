@@ -8,6 +8,24 @@ This repo holds verification for both of Mandate's modes (PL-16, BP-2):
 | Governed programmes | The reusable verify workflow: build the exact commit, run the protected test set, attest the evidence bundle | [.github/workflows/verify.yml](.github/workflows/verify.yml) |
 | Build mode (Mandate built by its swarm) | `mandate-runner`: grades the swarm's PRs and posts `mandate/build-verified` | [services/mandate-runner](services/mandate-runner) |
 
+## The evidence bundle (governed programmes)
+
+`verify.yml` has two jobs. `test` has `contents: read` only: it checks out the validated commit, runs `make setup` and pytest and uploads raw outputs. It holds no OIDC token and cannot attest. `attest` is the only job with `id-token` and `attestations: write`, and it runs no code from the target repo: it recomputes the digest from git objects, builds the binding from the raw outputs, attests `evidence.tgz` and uploads it as `evidence-<commit>-<run_attempt>`. The workflow fails after attesting when the result is not `pass`.
+
+Inputs: `commit` (must match `^[0-9a-f]{40}$`), `test-set` (space-separated plain relative tracked paths, passed to pytest after `--`; empty, leading `-`, `=`, `..` and absolute paths are rejected), `quarantine` (pytest node ids, each with `::`, each exactly one collected test; the count is recorded) and `plugins` (pytest plugin modules, since plugin autoload is off).
+
+pytest runs with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, a trusted config written by the workflow (`-c`, `-o addopts=`, explicit `--rootdir`), and no cache provider. After the run the test job records whether `git diff` and untracked files were clean; the bundle carries `worktree_clean`.
+
+Bundle files (all in `evidence.tgz`, each hashed in `binding.json`): `binding.json`, `report.json`, `environment.json`, `junit.xml`, `collected.txt` (collected node ids), `digest-inputs.txt`.
+
+`binding.json` carries: `repository` (the caller), `commit`, `caller_sha`, `workflow_ref`, `event_name`, `run_id`, `run_attempt`, `test_set`, `test_set_digest`, `quarantine`, `plugins`, `result`, `artifacts` (sha256 per file). `report.json` has `result` (`pass` only when pytest exit 0, collection exit 0, tests > 0, failures + errors = 0, and tests = collected - deselected; every testsuite is summed), counts, `collected`, `deselected`, `worktree_clean`.
+
+**Test-set digest format.** From git objects at `commit` (never the working tree): every tracked blob under the `test-set` paths, plus every `conftest.py` anywhere in the commit, plus root `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini` when tracked. Only modes 100644 and 100755 are allowed (symlinks and submodules fail the run). One line per file, `<sha256 of the blob content hex>`, two spaces, `<path>`, newline; sorted by path bytes; no other lines. The digest is the sha256 hex of those lines. `digest-inputs.txt` is exactly that text; recompute it with `git ls-tree -r -z <commit>` and `git cat-file blob`.
+
+**Environment manifest.** It records the runner image, OS, Python and every installed package. Service versions and seeded data are deferred until a target needs services (decision pending with KD).
+
+**Accepted risk.** The test job runs the target's own code. Application code that patches pytest in process (or a test that rewrites its own junit output) can make a run look better than it was; the digest binds which tests exist, not how the code behaves in process. It cannot forge a signature: it has no OIDC token, and the attest job never runs repo code.
+
 ## mandate-runner
 
 Builds Mandate's swarm, wave B0, tasks B0-01 and B0-02 (Mandate engineering-ready PRD PL-16). This is plain Python, with no model. Every 30 seconds it polls open PRs on `drivestream-lab/mandate` and `drivestream-lab/mandate-control-tower`. For each PR head into `develop` or `main` it posts the commit status `mandate/build-verified`.
