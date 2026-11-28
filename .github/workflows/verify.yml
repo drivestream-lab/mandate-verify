@@ -41,6 +41,8 @@ env:
   VERIFY_PYTHON: "3.12.8"
   VERIFY_PYTEST: "8.3.5"
   VERIFY_PYTEST_ASYNCIO: "0.26.0"
+  # sha256 of the tools tree installed on ubuntu-24.04 (format in README.md)
+  VERIFY_TOOLS_DIGEST: "54ff977a07d517cb8c57a1060df60c314c6e505d397c43540d962cf6c22f0fa1"
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -80,6 +82,8 @@ jobs:
             n=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" -- "$tok" | tr -cd '\0' | wc -c)
             [[ "$n" -gt 0 ]] || { echo "not a tracked path at the commit: $tok"; exit 1; }
           done
+          binaries=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" | tr '\0' '\n' | grep -E '(\.pyc|\.pyo|\.so|\.pyd)$|(^|/)__pycache__/' || true)
+          [[ -z "$binaries" ]] || { echo "the commit tracks compiled files: $binaries"; exit 1; }
           for f in poetry.lock pyproject.toml; do
             n=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" -- "$f" | tr -cd '\0' | wc -c)
             [[ "$n" -eq 1 ]] || { echo "$f is not tracked at the commit"; exit 1; }
@@ -100,8 +104,8 @@ jobs:
           VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
           # The process baseline comes before the first venv or pip call.
           /bin/ps -eo pid= | tr -d ' ' | sort > "$RUNNER_TEMP/pids-before.txt"
-          "$PYBIN" -I -m venv "$VENV"
-          pip() { "$VENV/bin/python" -I -m pip --isolated --disable-pip-version-check --no-input "$@"; }
+          "$PYBIN" -I -B -m venv "$VENV"
+          pip() { "$VENV/bin/python" -I -B -m pip --isolated --disable-pip-version-check --no-input "$@"; }
           # The workflow's own pytest, in a separate location.
           cat > "$RUNNER_TEMP/tools-requirements.txt" <<'REQ'
           pytest==8.3.5 --hash=sha256:c69214aa47deac29fad6c2a4f590b9c4a9fdb16a403176fe154b79c0b4d4d820
@@ -111,10 +115,88 @@ jobs:
           pytest-asyncio==0.26.0 --hash=sha256:7b51ed894f4fbea1340262bdae5135797ebbe21d8638978e35d31c6d19f72fb0
           REQ
           pip install --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
-            --require-hashes --target "$TOOLS" -r "$RUNNER_TEMP/tools-requirements.txt"
+            --require-hashes --no-compile --target "$TOOLS" -r "$RUNNER_TEMP/tools-requirements.txt"
+          # Trusted helpers, written by the workflow: a bootstrap that orders sys.path as
+          # standard library, tools, site-packages, checkout; a plugin that checks which files
+          # the loaded modules come from; a tree hasher.
+          BOOT="$RUNNER_TEMP/boot"; mkdir -p "$BOOT"
+          cat > "$BOOT/bootstrap.py" <<'PY'
+          import importlib.machinery, os, sys
+          tools, site, checkout, mode, *rest = sys.argv[1:]
+          sys.verify_paths = (os.path.dirname(os.__file__), tools, site, checkout)
+          # No standard-library name may be found in tools, site-packages or the checkout
+          # (the standard library's own test package is not imported by pytest).
+          shadow = sorted(
+              name for name in sys.stdlib_module_names
+              if name != "test" and importlib.machinery.PathFinder.find_spec(name, [tools, site, checkout])
+          )
+          if shadow:
+              raise SystemExit("standard library names found outside the standard library: " + " ".join(shadow))
+          sys.path.extend([tools, site, checkout])
+          if mode == "pytest":
+              import pytest
+              sys.argv = ["pytest", *rest]
+              raise SystemExit(pytest.main(rest))
+          path, *args = rest
+          sys.argv = [path, *args]
+          exec(compile(open(path).read(), path, "exec"), {"__name__": "__main__"})
+          PY
+          cat > "$TOOLS/verify_guard.py" <<'PY'
+          import os, sys
+          import pytest
+
+
+          def _outside():
+              std, tools, site, checkout = (os.path.realpath(p) for p in sys.verify_paths)
+              roots = (std, tools, site, checkout)
+              bad = []
+              for name, mod in list(sys.modules.items()):
+                  path = getattr(mod, "__file__", None)
+                  if not path or name in ("__main__", "__mp_main__"):
+                      continue  # the bootstrap itself
+                  real = os.path.realpath(path)
+                  if not any(real == r or real.startswith(r + os.sep) for r in roots):
+                      bad.append(f"{name} -> {real}")
+                  elif name.split(".")[0] in sys.stdlib_module_names and not (
+                      real == std or real.startswith(std + os.sep)
+                  ):
+                      bad.append(f"{name} (standard library name) -> {real}")
+              return bad
+
+
+          def pytest_collection_finish(session):
+              bad = _outside()
+              if bad:
+                  raise pytest.UsageError("modules outside the allowed paths: " + "; ".join(bad))
+
+
+          def pytest_sessionfinish(session, exitstatus):
+              if _outside():
+                  session.exitstatus = pytest.ExitCode.INTERNAL_ERROR
+          PY
+          cat > "$BOOT/treehash.py" <<'PY'
+          import hashlib, os, sys
+          root = sys.argv[1]
+          h = hashlib.sha256()
+          for base, dirs, files in os.walk(root):
+              dirs.sort()
+              for name in sorted(files):
+                  path = os.path.join(base, name)
+                  rel = os.path.relpath(path, root)
+                  if os.path.islink(path):
+                      h.update(f"link {rel} {os.readlink(path)}\n".encode())
+                  else:
+                      h.update(f"file {rel} {hashlib.sha256(open(path, 'rb').read()).hexdigest()}\n".encode())
+          print(h.hexdigest())
+          PY
+          bytecode=$(/usr/bin/find "$TOOLS" \( -name __pycache__ -o -name '*.pyc' \) -print)
+          [[ -z "$bytecode" ]] || { echo "bytecode in the tools: $bytecode"; exit 1; }
+          "$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS" > "$RUNNER_TEMP/tools-digest.txt"
+          [[ "$(cat "$RUNNER_TEMP/tools-digest.txt")" == "$VERIFY_TOOLS_DIGEST" ]] \
+            || { echo "the pinned tool set changed: computed $(cat "$RUNNER_TEMP/tools-digest.txt"), expected $VERIFY_TOOLS_DIGEST"; exit 1; }
           # Requirements with hashes, from the commit's poetry.lock only; every field is
           # validated before it is written, so the file can hold nothing but requirement lines.
-          "$PYBIN" -I - "$CHECKOUT/poetry.lock" "$RUNNER_TEMP/lock-requirements.txt" "$TOOLS" <<'PY'
+          "$PYBIN" -I -B - "$CHECKOUT/poetry.lock" "$RUNNER_TEMP/lock-requirements.txt" "$TOOLS" <<'PY'
           import re, sys, tomllib
           sys.path.insert(0, sys.argv[3])
           from packaging.markers import Marker
@@ -149,7 +231,11 @@ jobs:
           PY
           pip install --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
             --require-hashes -r "$RUNNER_TEMP/lock-requirements.txt"
-          "$VENV/bin/python" -I -c 'import sysconfig; a=sysconfig.get_path("purelib"); assert a==sysconfig.get_path("platlib"); print(a)' > "$RUNNER_TEMP/site-path.txt"
+          # Nothing from $VENV/bin runs after the lock install: the site-packages path is derived,
+          # not queried from the venv's interpreter.
+          pyver=$("$PYBIN" -I -S -B -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          test -d "$VENV/lib/python$pyver/site-packages"
+          echo "$VENV/lib/python$pyver/site-packages" > "$RUNNER_TEMP/site-path.txt"
       - name: Collect, run the protected test set and record the raw outputs
         env:
           PYBIN: ${{ steps.py.outputs.python-path }}
@@ -159,27 +245,39 @@ jobs:
           RAW="$RUNNER_TEMP/raw"; mkdir -p "$RAW"
           VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
           SITE=$(cat "$RUNNER_TEMP/site-path.txt")
-          # No .pth file and no sitecustomize or usercustomize may exist where the run
-          # imports from: the venv's site-packages, the tools, the checkout root.
-          stray=$(/usr/bin/find "$SITE" "$TOOLS" "$PWD" -maxdepth 1 \( -name '*.pth' -o -name 'sitecustomize*' -o -name 'usercustomize*' \) -print)
+          BOOT="$RUNNER_TEMP/boot"
+          # Every interpreter start below is -S, so no .pth in site-packages ever loads. A
+          # .pth in the checkout root, and any sitecustomize or usercustomize anywhere, fail.
+          stray=$(/usr/bin/find "$SITE" "$TOOLS" "$PWD" -maxdepth 1 \( -name 'sitecustomize*' -o -name 'usercustomize*' \) -print; /usr/bin/find "$PWD" -maxdepth 1 -name '*.pth' -print)
           [[ -z "$stray" ]] || { echo "stray startup file(s): $stray"; exit 1; }
-          # The venv's python starts with -S (no site processing, so no .pth and no
-          # sitecustomize) and -P (no implicit current directory), from an empty environment,
-          # with an explicit path: tools, then site-packages, then the checkout.
+          # The tools must hold no bytecode and must hash to what was recorded after the install.
+          tools_ok() {
+            local stray
+            stray=$(/usr/bin/find "$TOOLS" \( -name __pycache__ -o -name '*.pyc' \) -print)
+            [[ -z "$stray" ]] || { echo "bytecode in the tools $1: $stray"; return 1; }
+            [[ "$("$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS")" == "$(cat "$RUNNER_TEMP/tools-digest.txt")" ]] || { echo "the tools changed $1"; return 1; }
+          }
+          tools_ok "before collection" || exit 1
+          # The runner's own interpreter is started with -I -S -B from an empty environment,
+          # by a fixed bootstrap: the path is the standard library, then tools, then
+          # site-packages, then the checkout. Nothing from $VENV/bin is ever executed.
           vpy() {
+            # a fresh, never reused bytecode prefix for every call, so nothing earlier can pre-fill it
+            local pycache
+            pycache=$(/usr/bin/mktemp -d "$RUNNER_TEMP/pycache.XXXXXX")
             /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 TZ=UTC \
-              PYTHONPATH="$TOOLS:$SITE:$PWD" PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-              "$VENV/bin/python" -S -P "$@"
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+              "$PYBIN" -I -S -B -X pycache_prefix="$pycache" "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
           }
           survivors() {
             sleep 2
             /bin/ps -eo pid=,ppid=,comm= > "$RUNNER_TEMP/ps-now.txt"
-            /usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$3}' \
+            /usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top && !($2==1 && $3=="systemd-timedat") {print $1" "$3}' \
               "$RUNNER_TEMP/pids-before.txt" "$RUNNER_TEMP/ps-now.txt"
           }
           # pytest and every plugin must resolve inside the pinned tools, never the checkout,
           # and no sitecustomize or usercustomize may resolve anywhere.
-          vpy - "$TOOLS" "$PWD" $PLUGINS > "$RAW/module-origins.json" <<'PY' || { echo "a pytest module resolves outside the pinned tools"; exit 1; }
+          cat > "$BOOT/origins.py" <<'PY'
           import importlib.util, json, os, sys
           tools, checkout, *plugins = sys.argv[1:]
           tools, checkout = os.path.realpath(tools), os.path.realpath(checkout)
@@ -197,13 +295,14 @@ jobs:
                   raise SystemExit(f"{name} is importable")
           print(json.dumps(origins, indent=2, sort_keys=True))
           PY
+          vpy script "$BOOT/origins.py" "$TOOLS" "$PWD" $PLUGINS > "$RAW/module-origins.json" || { echo "a pytest module resolves outside the pinned tools"; exit 1; }
           printf '[pytest]\n' > "$RUNNER_TEMP/verify-pytest.ini"
           opts=(-c "$RUNNER_TEMP/verify-pytest.ini" --rootdir "$PWD" --confcutdir "$PWD" -o addopts= \
-                -p no:cacheprovider --import-mode=importlib -o junit_family=xunit2)
+                -p no:cacheprovider --import-mode=importlib -o junit_family=xunit2 -p verify_guard)
           for mod in $PLUGINS; do opts+=(-p "$mod" -o asyncio_mode=auto); done
           read -ra tokens <<< "$TEST_SET"
           printf '%s\n' $PLUGINS > "$RAW/plugins.txt"
-          vpy -m pytest --collect-only -q "${opts[@]}" -- "${tokens[@]}" > "$RAW/collect.out" 2>&1
+          vpy pytest --collect-only -q "${opts[@]}" -- "${tokens[@]}" > "$RAW/collect.out" 2>&1
           echo "$?" > "$RAW/collect-exit-code.txt"
           /usr/bin/awk 'NF==0{exit} {print}' "$RAW/collect.out" | grep -F '::' > "$RAW/collected.txt" || : > "$RAW/collected.txt"
           s=$(survivors); [[ -z "$s" ]] || { echo "a process started by the collection is still running: $s"; exit 1; }
@@ -216,8 +315,11 @@ jobs:
             deselect+=(--deselect "$id")
           done
           printf '%s\n' $QUARANTINE > "$RAW/quarantine.txt"
-          vpy -m pytest -q "${opts[@]}" "${deselect[@]}" --junitxml="$RAW/junit.xml" -- "${tokens[@]}"
+          tools_ok "before the run" || exit 1
+          vpy pytest -q "${opts[@]}" "${deselect[@]}" --junitxml="$RAW/junit.xml" -- "${tokens[@]}"
           echo "$?" > "$RAW/pytest-exit-code.txt"
+          tools_ok "during the run" || exit 1
+          cp "$RUNNER_TEMP/tools-digest.txt" "$RAW/tools-digest.txt"
           s=$(survivors); [[ -z "$s" ]] || { echo "a process started by the test run is still running: $s"; exit 1; }
           # Advisory only: the same code that ran the tests could have changed this answer.
           "$GIT" status --porcelain --untracked-files=all > "$RUNNER_TEMP/status.txt"
@@ -227,7 +329,7 @@ jobs:
           # The manifest is written by the runner's own python from the installed
           # distributions' metadata; the venv's python is not started.
           cd "$RUNNER_TEMP"
-          "$PYBIN" -I - "$RAW/environment.json" "$SITE" <<'PY'
+          "$PYBIN" -I -B - "$RAW/environment.json" "$SITE" <<'PY'
           import hashlib, importlib.metadata, json, os, platform, sys
           packages = sorted(f"{d.metadata['Name']}=={d.version}"
                             for d in importlib.metadata.distributions(path=[sys.argv[2]]))
@@ -246,7 +348,7 @@ jobs:
           set -euo pipefail
           /bin/sleep 2
           /bin/ps -eo pid=,ppid=,comm= > "$RUNNER_TEMP/ps-final.txt"
-          s=$(/usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$3}' "$RUNNER_TEMP/pids-before.txt" "$RUNNER_TEMP/ps-final.txt")
+          s=$(/usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top && !($2==1 && $3=="systemd-timedat") {print $1" "$3}' "$RUNNER_TEMP/pids-before.txt" "$RUNNER_TEMP/ps-final.txt")
           [[ -z "$s" ]] || { echo "a process is still running before the upload: $s"; exit 1; }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -410,6 +512,11 @@ jobs:
               "deselected": len(quarantine), "ids_match_collected": ran == expected,
               "junit_attributes_consistent": consistent,
           }
+          tools_digest = (raw / "tools-digest.txt").read_text().strip()
+          if not re.fullmatch(r"[0-9a-f]{64}", tools_digest):
+              raise SystemExit("bad tools digest")
+          if tools_digest != os.environ["VERIFY_TOOLS_DIGEST"]:
+              raise SystemExit("the tools digest differs from the pinned constant")
           env = json.loads((raw / "environment.json").read_text())
           (out / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True))
           (out / "environment.json").write_text(json.dumps(env, indent=2, sort_keys=True))
@@ -428,6 +535,7 @@ jobs:
               "test_set": tokens,
               "test_set_digest": digest,
               "dependencies_digest": dependencies_digest,
+              "tools_digest": tools_digest,
               "collected_digest": collected_digest,
               "quarantine": quarantine,
               "plugins": plugins,
