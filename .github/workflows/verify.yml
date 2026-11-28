@@ -104,6 +104,9 @@ jobs:
           VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
           # The process baseline comes before the first venv or pip call.
           /bin/ps -eo pid= | tr -d ' ' | sort > "$RUNNER_TEMP/pids-before.txt"
+          # The baseline is kept in a root-owned, read-only copy that later steps read.
+          sudo install -d -m 0755 -o root -g root /var/lib/verify-baseline
+          sudo install -m 0444 -o root -g root "$RUNNER_TEMP/pids-before.txt" /var/lib/verify-baseline/pids-before.txt
           "$PYBIN" -I -B -m venv "$VENV"
           pip() { "$VENV/bin/python" -I -B -m pip --isolated --disable-pip-version-check --no-input "$@"; }
           # The workflow's own pytest, in a separate location.
@@ -269,22 +272,30 @@ jobs:
               PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
               "$PYBIN" -I -S -B -X pycache_prefix="$pycache" "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
           }
-          survivors() {
-            sleep 2
-            /bin/ps -eo pid=,ppid=,comm= > "$RUNNER_TEMP/ps-now.txt"
-            /usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' \
-              "$RUNNER_TEMP/pids-before.txt" "$RUNNER_TEMP/ps-now.txt" | {
-            # Kernel threads are not survivors: PID 2 (kthreadd) itself, and a child of PID 2
-            # whose /proc/<pid>/exe cannot be read. systemd-timedated, started on demand by
-            # D-Bus, is the one service excepted: parent PID 1 and its own cgroup. Never by name.
-            while read -r pid ppid comm; do
-              [[ -d "/proc/$pid" ]] || continue
+          new_processes() {
+            # Processes that are not in the baseline, minus this shell's own helpers. Kernel threads are
+            # not survivors: PID 2 (kthreadd) itself, and a child of PID 2 whose /proc/<pid>/exe cannot be
+            # read. systemd-timedated, started on demand by D-Bus, is the one service excepted, and only
+            # when it is exactly the system service: parent PID 1, cgroup exactly
+            # 0::/system.slice/systemd-timedated.service, exe /usr/lib/systemd/systemd-timedated, uid 0.
+            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$BASHPID -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
               [[ "$pid" == 2 ]] && continue
               if [[ "$ppid" == 2 ]] && ! /usr/bin/readlink "/proc/$pid/exe" > /dev/null 2>&1; then continue; fi
-              if [[ "$ppid" == 1 ]] && /bin/grep -q 'systemd-timedated\.service' "/proc/$pid/cgroup" 2> /dev/null; then continue; fi
+              if [[ "$ppid" == 1 && "$(/bin/cat "/proc/$pid/cgroup" 2> /dev/null)" == "0::/system.slice/systemd-timedated.service" \
+                && "$(/usr/bin/readlink "/proc/$pid/exe" 2> /dev/null)" == /usr/lib/systemd/systemd-timedated \
+                && "$(/usr/bin/stat -c %u "/proc/$pid" 2> /dev/null)" == 0 ]]; then continue; fi
               echo "$pid $comm"
             done
-            }
+          }
+          # Two snapshots about a second apart: a process that hops from PID to PID (fork, parent
+          # exits, repeat) always shows at least one new process in each, a one-off transient does not.
+          survivors() {
+            local first second
+            /bin/sleep 1
+            first=$(new_processes)
+            /bin/sleep 1
+            second=$(new_processes)
+            if [[ -n "$first" && -n "$second" ]]; then printf '%s\n%s\n' "$first" "$second" | /usr/bin/sort -u; fi
           }
           # pytest and every plugin must resolve inside the pinned tools, never the checkout,
           # and no sitecustomize or usercustomize may resolve anywhere.
@@ -357,20 +368,32 @@ jobs:
       - name: Final check that no process of the build or the run is still alive
         run: |
           set -euo pipefail
-          /bin/sleep 2
-          /bin/ps -eo pid=,ppid=,comm= > "$RUNNER_TEMP/ps-final.txt"
-          s=$(/usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' "$RUNNER_TEMP/pids-before.txt" "$RUNNER_TEMP/ps-final.txt" | {
-          # Kernel threads are not survivors: PID 2 (kthreadd) itself, and a child of PID 2
-          # whose /proc/<pid>/exe cannot be read. systemd-timedated, started on demand by
-          # D-Bus, is the one service excepted: parent PID 1 and its own cgroup. Never by name.
-          while read -r pid ppid comm; do
-            [[ -d "/proc/$pid" ]] || continue
-            [[ "$pid" == 2 ]] && continue
-            if [[ "$ppid" == 2 ]] && ! /usr/bin/readlink "/proc/$pid/exe" > /dev/null 2>&1; then continue; fi
-            if [[ "$ppid" == 1 ]] && /bin/grep -q 'systemd-timedated\.service' "/proc/$pid/cgroup" 2> /dev/null; then continue; fi
-            echo "$pid $comm"
-          done
-          })
+          new_processes() {
+            # Processes that are not in the baseline, minus this shell's own helpers. Kernel threads are
+            # not survivors: PID 2 (kthreadd) itself, and a child of PID 2 whose /proc/<pid>/exe cannot be
+            # read. systemd-timedated, started on demand by D-Bus, is the one service excepted, and only
+            # when it is exactly the system service: parent PID 1, cgroup exactly
+            # 0::/system.slice/systemd-timedated.service, exe /usr/lib/systemd/systemd-timedated, uid 0.
+            /bin/ps -eo pid=,ppid=,comm= | /usr/bin/awk -v me=$BASHPID -v top=$$ -v base=/var/lib/verify-baseline/pids-before.txt 'BEGIN{while((getline l < base)>0) b[l]=1} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top {print $1" "$2" "$3}' | while read -r pid ppid comm; do
+              [[ "$pid" == 2 ]] && continue
+              if [[ "$ppid" == 2 ]] && ! /usr/bin/readlink "/proc/$pid/exe" > /dev/null 2>&1; then continue; fi
+              if [[ "$ppid" == 1 && "$(/bin/cat "/proc/$pid/cgroup" 2> /dev/null)" == "0::/system.slice/systemd-timedated.service" \
+                && "$(/usr/bin/readlink "/proc/$pid/exe" 2> /dev/null)" == /usr/lib/systemd/systemd-timedated \
+                && "$(/usr/bin/stat -c %u "/proc/$pid" 2> /dev/null)" == 0 ]]; then continue; fi
+              echo "$pid $comm"
+            done
+          }
+          # Two snapshots about a second apart: a process that hops from PID to PID (fork, parent
+          # exits, repeat) always shows at least one new process in each, a one-off transient does not.
+          survivors() {
+            local first second
+            /bin/sleep 1
+            first=$(new_processes)
+            /bin/sleep 1
+            second=$(new_processes)
+            if [[ -n "$first" && -n "$second" ]]; then printf '%s\n%s\n' "$first" "$second" | /usr/bin/sort -u; fi
+          }
+          s=$(survivors)
           [[ -z "$s" ]] || { echo "a process is still running before the upload: $s"; exit 1; }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
