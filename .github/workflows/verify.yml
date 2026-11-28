@@ -104,8 +104,8 @@ jobs:
           VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
           # The process baseline comes before the first venv or pip call.
           /bin/ps -eo pid= | tr -d ' ' | sort > "$RUNNER_TEMP/pids-before.txt"
-          "$PYBIN" -I -m venv "$VENV"
-          pip() { "$VENV/bin/python" -I -m pip --isolated --disable-pip-version-check --no-input "$@"; }
+          "$PYBIN" -I -B -m venv "$VENV"
+          pip() { "$VENV/bin/python" -I -B -m pip --isolated --disable-pip-version-check --no-input "$@"; }
           # The workflow's own pytest, in a separate location.
           cat > "$RUNNER_TEMP/tools-requirements.txt" <<'REQ'
           pytest==8.3.5 --hash=sha256:c69214aa47deac29fad6c2a4f590b9c4a9fdb16a403176fe154b79c0b4d4d820
@@ -179,8 +179,8 @@ jobs:
           root = sys.argv[1]
           h = hashlib.sha256()
           for base, dirs, files in os.walk(root):
-              dirs[:] = sorted(d for d in dirs if d != "__pycache__")
-              for name in sorted(f for f in files if not f.endswith(".pyc")):
+              dirs.sort()
+              for name in sorted(files):
                   path = os.path.join(base, name)
                   rel = os.path.relpath(path, root)
                   if os.path.islink(path):
@@ -189,12 +189,14 @@ jobs:
                       h.update(f"file {rel} {hashlib.sha256(open(path, 'rb').read()).hexdigest()}\n".encode())
           print(h.hexdigest())
           PY
+          bytecode=$(/usr/bin/find "$TOOLS" \( -name __pycache__ -o -name '*.pyc' \) -print)
+          [[ -z "$bytecode" ]] || { echo "bytecode in the tools: $bytecode"; exit 1; }
           "$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS" > "$RUNNER_TEMP/tools-digest.txt"
           [[ "$(cat "$RUNNER_TEMP/tools-digest.txt")" == "$VERIFY_TOOLS_DIGEST" ]] \
             || { echo "the pinned tool set changed: computed $(cat "$RUNNER_TEMP/tools-digest.txt"), expected $VERIFY_TOOLS_DIGEST"; exit 1; }
           # Requirements with hashes, from the commit's poetry.lock only; every field is
           # validated before it is written, so the file can hold nothing but requirement lines.
-          "$PYBIN" -I - "$CHECKOUT/poetry.lock" "$RUNNER_TEMP/lock-requirements.txt" "$TOOLS" <<'PY'
+          "$PYBIN" -I -B - "$CHECKOUT/poetry.lock" "$RUNNER_TEMP/lock-requirements.txt" "$TOOLS" <<'PY'
           import re, sys, tomllib
           sys.path.insert(0, sys.argv[3])
           from packaging.markers import Marker
@@ -231,7 +233,7 @@ jobs:
             --require-hashes -r "$RUNNER_TEMP/lock-requirements.txt"
           # Nothing from $VENV/bin runs after the lock install: the site-packages path is derived,
           # not queried from the venv's interpreter.
-          pyver=$("$PYBIN" -I -S -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          pyver=$("$PYBIN" -I -S -B -c 'import sys; print("%d.%d" % sys.version_info[:2])')
           test -d "$VENV/lib/python$pyver/site-packages"
           echo "$VENV/lib/python$pyver/site-packages" > "$RUNNER_TEMP/site-path.txt"
       - name: Collect, run the protected test set and record the raw outputs
@@ -244,20 +246,28 @@ jobs:
           VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
           SITE=$(cat "$RUNNER_TEMP/site-path.txt")
           BOOT="$RUNNER_TEMP/boot"
-          PYCACHE="$RUNNER_TEMP/pycache-empty"; mkdir -p "$PYCACHE"
           # Every interpreter start below is -S, so no .pth in site-packages ever loads. A
           # .pth in the checkout root, and any sitecustomize or usercustomize anywhere, fail.
           stray=$(/usr/bin/find "$SITE" "$TOOLS" "$PWD" -maxdepth 1 \( -name 'sitecustomize*' -o -name 'usercustomize*' \) -print; /usr/bin/find "$PWD" -maxdepth 1 -name '*.pth' -print)
           [[ -z "$stray" ]] || { echo "stray startup file(s): $stray"; exit 1; }
-          tools_digest() { "$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS"; }
-          [[ "$(tools_digest)" == "$(cat "$RUNNER_TEMP/tools-digest.txt")" ]] || { echo "the tools changed before collection"; exit 1; }
+          # The tools must hold no bytecode and must hash to what was recorded after the install.
+          tools_ok() {
+            local stray
+            stray=$(/usr/bin/find "$TOOLS" \( -name __pycache__ -o -name '*.pyc' \) -print)
+            [[ -z "$stray" ]] || { echo "bytecode in the tools $1: $stray"; return 1; }
+            [[ "$("$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS")" == "$(cat "$RUNNER_TEMP/tools-digest.txt")" ]] || { echo "the tools changed $1"; return 1; }
+          }
+          tools_ok "before collection" || exit 1
           # The runner's own interpreter is started with -I -S -B from an empty environment,
           # by a fixed bootstrap: the path is the standard library, then tools, then
           # site-packages, then the checkout. Nothing from $VENV/bin is ever executed.
           vpy() {
+            # a fresh, never reused bytecode prefix for every call, so nothing earlier can pre-fill it
+            local pycache
+            pycache=$(/usr/bin/mktemp -d "$RUNNER_TEMP/pycache.XXXXXX")
             /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 TZ=UTC \
               PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-              "$PYBIN" -I -S -B -X pycache_prefix="$PYCACHE" "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
+              "$PYBIN" -I -S -B -X pycache_prefix="$pycache" "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
           }
           survivors() {
             sleep 2
@@ -305,10 +315,10 @@ jobs:
             deselect+=(--deselect "$id")
           done
           printf '%s\n' $QUARANTINE > "$RAW/quarantine.txt"
-          [[ "$(tools_digest)" == "$(cat "$RUNNER_TEMP/tools-digest.txt")" ]] || { echo "the tools changed before the run"; exit 1; }
+          tools_ok "before the run" || exit 1
           vpy pytest -q "${opts[@]}" "${deselect[@]}" --junitxml="$RAW/junit.xml" -- "${tokens[@]}"
           echo "$?" > "$RAW/pytest-exit-code.txt"
-          [[ "$(tools_digest)" == "$(cat "$RUNNER_TEMP/tools-digest.txt")" ]] || { echo "the tools changed during the run"; exit 1; }
+          tools_ok "during the run" || exit 1
           cp "$RUNNER_TEMP/tools-digest.txt" "$RAW/tools-digest.txt"
           s=$(survivors); [[ -z "$s" ]] || { echo "a process started by the test run is still running: $s"; exit 1; }
           # Advisory only: the same code that ran the tests could have changed this answer.
@@ -319,7 +329,7 @@ jobs:
           # The manifest is written by the runner's own python from the installed
           # distributions' metadata; the venv's python is not started.
           cd "$RUNNER_TEMP"
-          "$PYBIN" -I - "$RAW/environment.json" "$SITE" <<'PY'
+          "$PYBIN" -I -B - "$RAW/environment.json" "$SITE" <<'PY'
           import hashlib, importlib.metadata, json, os, platform, sys
           packages = sorted(f"{d.metadata['Name']}=={d.version}"
                             for d in importlib.metadata.distributions(path=[sys.argv[2]]))
