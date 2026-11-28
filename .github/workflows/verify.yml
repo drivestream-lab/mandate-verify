@@ -41,6 +41,8 @@ env:
   VERIFY_PYTHON: "3.12.8"
   VERIFY_PYTEST: "8.3.5"
   VERIFY_PYTEST_ASYNCIO: "0.26.0"
+  # sha256 of the tools tree installed on ubuntu-24.04 (format in README.md)
+  VERIFY_TOOLS_DIGEST: "0000000000000000000000000000000000000000000000000000000000000000"
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -111,7 +113,7 @@ jobs:
           pytest-asyncio==0.26.0 --hash=sha256:7b51ed894f4fbea1340262bdae5135797ebbe21d8638978e35d31c6d19f72fb0
           REQ
           pip install --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
-            --require-hashes --target "$TOOLS" -r "$RUNNER_TEMP/tools-requirements.txt"
+            --require-hashes --no-compile --target "$TOOLS" -r "$RUNNER_TEMP/tools-requirements.txt"
           # Trusted helpers, written by the workflow: a bootstrap that orders sys.path as
           # standard library, tools, site-packages, checkout; a plugin that checks which files
           # the loaded modules come from; a tree hasher.
@@ -175,8 +177,8 @@ jobs:
           root = sys.argv[1]
           h = hashlib.sha256()
           for base, dirs, files in os.walk(root):
-              dirs.sort()
-              for name in sorted(files):
+              dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+              for name in sorted(f for f in files if not f.endswith(".pyc")):
                   path = os.path.join(base, name)
                   rel = os.path.relpath(path, root)
                   if os.path.islink(path):
@@ -186,6 +188,8 @@ jobs:
           print(h.hexdigest())
           PY
           "$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS" > "$RUNNER_TEMP/tools-digest.txt"
+          [[ "$(cat "$RUNNER_TEMP/tools-digest.txt")" == "$VERIFY_TOOLS_DIGEST" ]] \
+            || { echo "the pinned tool set changed: computed $(cat "$RUNNER_TEMP/tools-digest.txt"), expected $VERIFY_TOOLS_DIGEST"; exit 1; }
           # Requirements with hashes, from the commit's poetry.lock only; every field is
           # validated before it is written, so the file can hold nothing but requirement lines.
           "$PYBIN" -I - "$CHECKOUT/poetry.lock" "$RUNNER_TEMP/lock-requirements.txt" "$TOOLS" <<'PY'
