@@ -82,6 +82,8 @@ jobs:
             n=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" -- "$tok" | tr -cd '\0' | wc -c)
             [[ "$n" -gt 0 ]] || { echo "not a tracked path at the commit: $tok"; exit 1; }
           done
+          binaries=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" | tr '\0' '\n' | grep -E '(\.pyc|\.pyo|\.so|\.pyd)$|(^|/)__pycache__/' || true)
+          [[ -z "$binaries" ]] || { echo "the commit tracks compiled files: $binaries"; exit 1; }
           for f in poetry.lock pyproject.toml; do
             n=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" -- "$f" | tr -cd '\0' | wc -c)
             [[ "$n" -eq 1 ]] || { echo "$f is not tracked at the commit"; exit 1; }
@@ -242,6 +244,7 @@ jobs:
           VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
           SITE=$(cat "$RUNNER_TEMP/site-path.txt")
           BOOT="$RUNNER_TEMP/boot"
+          PYCACHE="$RUNNER_TEMP/pycache-empty"; mkdir -p "$PYCACHE"
           # Every interpreter start below is -S, so no .pth in site-packages ever loads. A
           # .pth in the checkout root, and any sitecustomize or usercustomize anywhere, fail.
           stray=$(/usr/bin/find "$SITE" "$TOOLS" "$PWD" -maxdepth 1 \( -name 'sitecustomize*' -o -name 'usercustomize*' \) -print; /usr/bin/find "$PWD" -maxdepth 1 -name '*.pth' -print)
@@ -254,7 +257,7 @@ jobs:
           vpy() {
             /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 TZ=UTC \
               PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-              "$PYBIN" -I -S -B "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
+              "$PYBIN" -I -S -B -X pycache_prefix="$PYCACHE" "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
           }
           survivors() {
             sleep 2
@@ -502,6 +505,8 @@ jobs:
           tools_digest = (raw / "tools-digest.txt").read_text().strip()
           if not re.fullmatch(r"[0-9a-f]{64}", tools_digest):
               raise SystemExit("bad tools digest")
+          if tools_digest != os.environ["VERIFY_TOOLS_DIGEST"]:
+              raise SystemExit("the tools digest differs from the pinned constant")
           env = json.loads((raw / "environment.json").read_text())
           (out / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True))
           (out / "environment.json").write_text(json.dumps(env, indent=2, sort_keys=True))
