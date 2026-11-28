@@ -1,0 +1,175 @@
+# mandate-runner (Compose profile `runner`). Engineering-ready PRD PL-16, tasks B0-01 and B0-02.
+# Usage: make deploy
+#
+# Four containers, one image for the three of them that are ours:
+#   mandate-runner           Polls Mandate's repos, posts mandate/build-verified, runs develop
+#                            after every merge. Holds the runner App's key (read-only) and is the
+#                            only thing that calls GitHub. The only one on lab_local.
+#   mandate-runner-dind      The sandbox: its own Docker engine where PR code runs. No secrets
+#                            from ~/.mandate/secrets/build/ are ever mounted here.
+#   mandate-runner-proxy     The sandbox's only way out: an HTTP proxy that reaches public
+#                            addresses only (not the lab, not Docker Desktop's host address).
+#   mandate-runner-deployer  The only one with the host's Docker engine. No key, no PR code:
+#                            it does two named jobs the runner asks for (rebuild the sandbox
+#                            with `make runner-reset-sandbox`, deploy the merged head).
+#
+# Networks:
+#   mandate_runner_sandbox   internal (no route out): runner, sandbox, proxy.
+#   mandate_runner_egress    the proxy's own way to the internet.
+#   lab_local                the lab's network (dev-infra-lab): the runner only. The deployed
+#                            Mandate service (lab-mandate) is started there by the deployer.
+#
+# Test secrets for journeys (off by default; W0 turns them on):
+#   set MANDATE_RUNNER_TEST_SECRETS=1 in .env to add docker-compose.runner-test-secrets.yml.
+
+name: mandate-runner
+
+x-proxy-env: &proxy-env
+  HTTP_PROXY: http://10.250.250.2:3128
+  HTTPS_PROXY: http://10.250.250.2:3128
+  NO_PROXY: localhost,127.0.0.1,::1
+
+services:
+  mandate-runner-dind:
+    image: docker:29-dind@sha256:4bbc7223f81db790097c6dea42fb93e05b8fead4f0431fbe6ccaba6e8473201c
+    profiles: ["runner"]
+    container_name: lab-mandate-runner-dind
+    hostname: mandate-runner-dind
+    privileged: true
+    networks:
+      - sandbox
+    environment:
+      # TLS with generated certs: only holders of the client cert (the runner) can drive it.
+      DOCKER_TLS_CERTDIR: /certs
+      # Image pulls go through the proxy; the sandbox network has no other way out.
+      <<: *proxy-env
+    volumes:
+      - mandate_runner_dind_certs:/certs
+      - mandate_runner_dind_data:/var/lib/docker
+      - mandate_runner_work:/work
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    depends_on:
+      mandate-runner-proxy:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mandate-runner-proxy:
+    # Same image as the runner (built by the mandate-runner service); no key, no Docker.
+    image: drivestream-lab/mandate-runner:local
+    profiles: ["runner"]
+    container_name: lab-mandate-runner-proxy
+    command: ["proxy"]
+    networks:
+      sandbox:
+        ipv4_address: 10.250.250.2
+      egress: {}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 3128), 2).close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  mandate-runner-deployer:
+    image: drivestream-lab/mandate-runner:local
+    profiles: ["runner"]
+    container_name: lab-mandate-runner-deployer
+    command: ["deployer"]
+    network_mode: none
+    environment:
+      MANDATE_RUNNER_CONFIG: /etc/mandate-runner/runner.toml
+      MANDATE_RUNNER_JOBS_DIR: /jobs
+      # make runner-reset-sandbox runs against the host engine, so it needs this checkout
+      # and $HOME at their host paths (set by the Makefile).
+      MANDATE_VERIFY_DIR: ${MANDATE_VERIFY_DIR:?run through make deploy}
+      HOME: ${HOME}
+      MANDATE_RUNNER_TEST_SECRETS: ${MANDATE_RUNNER_TEST_SECRETS:-0}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MANDATE_VERIFY_DIR}:${MANDATE_VERIFY_DIR}:ro
+      # The config directory, not the file: git replaces files on pull, which would
+      # leave a single-file mount pointing at the old copy.
+      - ./config/mandate-runner:/etc/mandate-runner:ro
+      # The deployed Mandate service's settings (KD's, outside the repos): mandate.env.
+      - ${HOME}/.mandate/lab:/config:ro
+      - mandate_runner_jobs:/jobs
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py", "/tmp/deployer-heartbeat"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  mandate-runner:
+    build:
+      context: services/mandate-runner
+      target: runtime
+    image: drivestream-lab/mandate-runner:local
+    profiles: ["runner"]
+    container_name: lab-mandate-runner
+    command: ["runner"]
+    networks:
+      - lab_local
+      - sandbox
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      MANDATE_RUNNER_CONFIG: /etc/mandate-runner/runner.toml
+      MANDATE_RUNNER_SECRETS_DIR: /run/secrets/mandate-runner
+      MANDATE_RUNNER_TEST_SECRETS: "0"
+      MANDATE_RUNNER_JOBS_DIR: /jobs
+      DOCKER_HOST: tcp://mandate-runner-dind:2376
+      DOCKER_TLS_VERIFY: "1"
+      DOCKER_CERT_PATH: /certs/client
+      # Hands the egress proxy to every build and container the runner starts in the sandbox.
+      DOCKER_CONFIG: /app/sandbox-docker-config
+    volumes:
+      # The runner App's key: read-only, this container only.
+      - ${HOME}/.mandate/secrets/build/mandate-runner:/run/secrets/mandate-runner:ro
+      - ./config/mandate-runner:/etc/mandate-runner:ro  # a directory: see the deployer
+      - type: volume
+        source: mandate_runner_dind_certs
+        target: /certs/client
+        read_only: true
+        volume:
+          subpath: client
+      - mandate_runner_data:/var/lib/mandate-runner
+      - mandate_runner_work:/work
+      - mandate_runner_jobs:/jobs
+    depends_on:
+      mandate-runner-dind:
+        condition: service_healthy
+      mandate-runner-deployer:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  lab_local:
+    name: lab_local
+    external: true
+  sandbox:
+    name: mandate_runner_sandbox
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.250.250.0/24
+  egress:
+    name: mandate_runner_egress
+
+volumes:
+  mandate_runner_data:
+    name: mandate_runner_data
+  mandate_runner_work:
+    name: mandate_runner_work
+  mandate_runner_dind_data:
+    name: mandate_runner_dind_data
+  mandate_runner_dind_certs:
+    name: mandate_runner_dind_certs
+  mandate_runner_jobs:
+    name: mandate_runner_jobs

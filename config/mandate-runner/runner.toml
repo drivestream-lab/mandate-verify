@@ -1,0 +1,158 @@
+# mandate-runner: grades PR heads on Mandate's repos and posts mandate/build-verified.
+# Engineering-ready PRD PL-16; implementation plan section 6, task B0-01.
+#
+# This file is the only source of the command set and the review rules.
+# Nothing in a pull request can change what the runner runs or checks.
+
+poll_interval_seconds = 30
+status_context = "mandate/build-verified"
+
+# Where run logs are served (read-only, bound to 127.0.0.1 on the host).
+log_base_url = "http://localhost:8090"
+
+# Inside the runner container (named volumes, see docker-compose.runner.yml).
+data_dir = "/var/lib/mandate-runner"
+# Shared with the sandbox so workspace paths are identical on both sides.
+work_dir = "/work"
+
+# Built inside the sandbox from services/mandate-runner/job-image and run by image id.
+job_image_tag = "drivestream-lab/mandate-runner-job:local"
+job_image_context = "/app/job-image"
+command_timeout_seconds = 3600
+
+[identities]
+runner_app_id = 5860839
+challenger_app_slug = "mandate-challenger"
+challenger_app_id = 5860827
+challenger_login = "mandate-challenger[bot]"
+# The wave signer: an App, never a person (KD, 27 Nov 2026: no gh users in the flow).
+signer_login = "mandate-challenger[bot]"
+runner_login = "mandate-runner[bot]"
+
+# A challenger review counts for a slot only when its body carries exactly one of
+# these lines. Trust-critical paths, protected paths and the fix for a red develop
+# need first and second, on separate reviews of the head. A wave PR needs the
+# signer's signoff review, after the verifier checked the deployed evidence.
+[markers]
+first = "Challenger: first"
+second = "Challenger: second"
+signoff = "Signoff: wave"
+
+# A wave PR: develop into main, signed by the signer App (signoff marker plus attestation).
+[wave]
+base_branch = "main"
+head_branch = "develop"
+label = "wave-accepted"
+initiative = "INIT-MANDATE-001"
+
+# One command set per base branch. PRs into any other base are not graded.
+# Every repo has the same five targets: setup (the project's .venv and packages),
+# check, test, deploy (build the branch in Docker and run it with its .env), verify
+# (every journey against what deploy started). A PR runs all five in the sandbox, on
+# the sandbox's own engine; the swarm's verifier then judges verify's output.
+[bases.develop]
+commands = ["make setup", "make check", "make test", "make deploy", "make verify"]
+
+[bases.main]
+commands = ["make setup", "make check", "make test", "make deploy", "make verify"]
+
+# The sandbox (Docker-in-Docker) is rebuilt from scratch with `make runner-reset-sandbox`
+# (run by the deployer): once a day, and after any run that did not pass.
+[sandbox]
+rebuild_interval_hours = 24
+rebuild_after_failure = true
+
+# B0-02. After every merge into develop on mandate, the runner checks the merged head
+# out and deploys it to the lab stack as the Mandate service through fixed steps (the
+# image is built in the sandbox; the deployer runs it with the lab .env, migrations
+# included). Then `make setup` and `make verify` run from the merged head, on
+# lab_local, against the deployed service. The repo's own `make deploy` is never run
+# with the host engine. Until the head has a Dockerfile and a `verify` target, the run
+# records "nothing to deploy yet" and passes.
+# A red run opens a bug issue on the repo (as mandate-runner, labelled freeze_label).
+# While one is open, every PR into task_base fails with "develop is red", except a PR
+# whose body says `Fixes #N` (or `drivestream-lab/mandate#N`) and has a second, separate
+# challenger Approve (Challenger: second) on its head. The runner closes the issue after a green run, which lifts the freeze.
+[develop_run]
+repo = "drivestream-lab/mandate"
+branch = "develop"
+task_base = "develop"
+commands = ["make setup", "make verify"]
+freeze_label = "develop-red"
+
+[develop_run.deploy]
+enabled = true
+container = "lab-mandate"
+network = "lab_local"
+image_repo = "drivestream-lab/mandate"
+# Inside the deployer: ~/.mandate/lab/mandate.env on the host (KD's, outside the repos):
+# the .env the service runs with, also handed to `make verify`.
+env_file = "/config/mandate.env"
+# The env file must point at the lab's Mandate database (dev-infra-lab provisions it,
+# with the mandate_owner and mandate_app roles). Kept across waves: each deploy runs
+# the migrations; a purge deletes the data and keeps the schema and the decision ledger
+# (append-only, ADR-020), only on request.
+database = "mandate"
+health_url = "http://localhost:8000/health"
+service_url = "http://lab-mandate:8000"
+
+[[repos]]
+name = "drivestream-lab/mandate"
+# PL-16 BP-6. A PR touching any of these needs a second, separate challenger Approve.
+protected_paths = [
+  "CLAUDE.md",
+  ".claude/agents/**",
+  ".cursor/rules",
+  ".cursor/rules/**",
+  ".gitmodules",
+  "docs/specification/adr/**",
+  "docs/specification/product/**",
+  "tests/journeys/**",
+  "tests/verify/**",
+  "Makefile",
+  ".importlinter",
+  ".pre-commit-config.yaml",
+]
+# "Tool settings in pyproject.toml": any change to a [tool.*] table.
+pyproject_tool_settings_protected = true
+# The ledger, the signoff check, evidence verification and merge control.
+# A PR touching any of these needs a second, separate challenger Approve.
+trust_critical_paths = [
+  # ledger
+  "src/**/ledger/**",
+  "src/models/ledger_models.py",
+  "tests/**/*ledger*",
+  # signoff check
+  "src/business_services/gates/signoff*_service.py",
+  "src/business_services/gates/gate_decision_check_service.py",
+  "src/models/signoff_models.py",
+  # evidence verification
+  "src/infra_services/attestation_service.py",
+  "src/business_services/release/evidence_verification_service.py",
+  "src/models/evidence_models.py",
+  "tests/journeys/**/*evidence*",
+  # merge control
+  "src/business_services/release/merge_service.py",
+  "src/business_services/release/unguarded_merge_sweep_service.py",
+  "src/infra_services/github_app_service.py",
+  "tests/journeys/**/*merge*",
+]
+
+[[repos]]
+name = "drivestream-lab/mandate-control-tower"
+protected_paths = [
+  "CLAUDE.md",
+  ".claude/agents/**",
+  ".cursor/rules",
+  ".cursor/rules/**",
+  ".gitmodules",
+  "docs/specification/adr/**",
+  "docs/specification/product/**",
+  "tests/journeys/**",
+  "tests/verify/**",
+  "Makefile",
+  ".importlinter",
+  ".pre-commit-config.yaml",
+]
+pyproject_tool_settings_protected = true
+trust_critical_paths = []

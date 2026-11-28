@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mandate-runner"
+version = "0.1.0"
+description = "Grades PR heads on Mandate's repos and posts mandate/build-verified (PL-16, B0-01)"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx==0.28.1",
+  "PyJWT[crypto]==2.15.1",
+  "cryptography==50.0.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

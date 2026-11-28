@@ -1,0 +1,11 @@
+.env
+*.local
+.DS_Store
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# Local runner override (make deploy RUNNER_LOCAL=1); never committed.
+docker-compose.runner.local.yml
+config/mandate-runner/*.local.toml
+.venv-verify/

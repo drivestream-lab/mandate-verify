@@ -1,0 +1,561 @@
+name: verify
+# Builds the exact commit into a clean environment, runs the protected test set and signs the
+# evidence bundle with an artifact attestation. Two jobs, so the code under test never shares
+# a job with the signing identity:
+#   test    contents: read only. The workflow itself builds the environment (pinned Python,
+#           the commit's validated poetry.lock installed with hashes, pinned pytest in a
+#           separate location). No Makefile or script of the target repo is ever run. Uploads
+#           raw outputs.
+#   attest  the only job with id-token and attestations write. Runs no code from the target
+#           repo: it recomputes the digests from git objects, derives the result from the raw
+#           outputs, attests the bundle, and fails unless the result is pass.
+# Mandate accepts a bundle only when this workflow, at its pinned tag, is the signer. The
+# bundle format and the digest format are documented in README.md.
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: The full 40-character commit to verify
+        required: true
+        type: string
+      test-set:
+        description: Space-separated tracked paths (files or directories) of the protected test set
+        required: false
+        default: tests/unit
+        type: string
+      quarantine:
+        description: Space-separated pytest node ids quarantined on the record (each contains ::)
+        required: false
+        default: ""
+        type: string
+      plugins:
+        description: Space-separated pytest plugins to load; only pytest_asyncio is allowed
+        required: false
+        default: ""
+        type: string
+permissions: {}
+concurrency:
+  group: verify-${{ github.repository }}-${{ inputs.commit }}
+  cancel-in-progress: false
+env:
+  VERIFY_PYTHON: "3.12.8"
+  VERIFY_PYTEST: "8.3.5"
+  VERIFY_PYTEST_ASYNCIO: "0.26.0"
+  # sha256 of the tools tree installed on ubuntu-24.04 (format in README.md)
+  VERIFY_TOOLS_DIGEST: "54ff977a07d517cb8c57a1060df60c314c6e505d397c43540d962cf6c22f0fa1"
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      COMMIT: ${{ inputs.commit }}
+      TEST_SET: ${{ inputs.test-set }}
+      QUARANTINE: ${{ inputs.quarantine }}
+      PLUGINS: ${{ inputs.plugins }}
+    steps:
+      - name: Validate the inputs
+        run: |
+          set -euo pipefail
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "commit must be 40 lowercase hex characters"; exit 1; }
+          [[ -n "${TEST_SET// /}" ]] || { echo "test-set is empty"; exit 1; }
+          for tok in $TEST_SET; do
+            [[ "$tok" =~ ^[A-Za-z0-9._/-]+$ && "$tok" != -* && "$tok" != /* && "/$tok/" != */../* ]] \
+              || { echo "test-set token is not a plain relative path: $tok"; exit 1; }
+          done
+          for id in $QUARANTINE; do
+            [[ "$id" == *::* && "$id" != -* ]] || { echo "quarantine id needs :: : $id"; exit 1; }
+          done
+          for mod in $PLUGINS; do
+            [[ "$mod" == pytest_asyncio ]] || { echo "plugin not allowed: $mod"; exit 1; }
+          done
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+          clean: true
+      - name: Check the checkout and that every test-set path and the lockfile are tracked
+        run: |
+          set -euo pipefail
+          test "$(/usr/bin/git rev-parse HEAD)" = "$COMMIT"
+          for tok in $TEST_SET; do
+            n=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" -- "$tok" | tr -cd '\0' | wc -c)
+            [[ "$n" -gt 0 ]] || { echo "not a tracked path at the commit: $tok"; exit 1; }
+          done
+          binaries=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" | tr '\0' '\n' | grep -E '(\.pyc|\.pyo|\.so|\.pyd)$|(^|/)__pycache__/' || true)
+          [[ -z "$binaries" ]] || { echo "the commit tracks compiled files: $binaries"; exit 1; }
+          for f in poetry.lock pyproject.toml; do
+            n=$(/usr/bin/git ls-tree -r --name-only -z "$COMMIT" -- "$f" | tr -cd '\0' | wc -c)
+            [[ "$n" -eq 1 ]] || { echo "$f is not tracked at the commit"; exit 1; }
+          done
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        id: py
+        with:
+          python-version: ${{ env.VERIFY_PYTHON }}
+      - name: Build the environment from the lockfile and the pinned pytest (no target scripts)
+        env:
+          PYBIN: ${{ steps.py.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          # Everything below runs from RUNNER_TEMP, by absolute path, with -I: the checkout is
+          # never on the import path of an installer or of this script.
+          cd "$RUNNER_TEMP"
+          CHECKOUT="$GITHUB_WORKSPACE"
+          VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
+          # The process baseline comes before the first venv or pip call.
+          /bin/ps -eo pid= | tr -d ' ' | sort > "$RUNNER_TEMP/pids-before.txt"
+          "$PYBIN" -I -B -m venv "$VENV"
+          pip() { "$VENV/bin/python" -I -B -m pip --isolated --disable-pip-version-check --no-input "$@"; }
+          # The workflow's own pytest, in a separate location.
+          cat > "$RUNNER_TEMP/tools-requirements.txt" <<'REQ'
+          pytest==8.3.5 --hash=sha256:c69214aa47deac29fad6c2a4f590b9c4a9fdb16a403176fe154b79c0b4d4d820
+          pluggy==1.5.0 --hash=sha256:44e1ad92c8ca002de6377e165f3e0f1be63266ab4d554740532335b9d75ea669
+          iniconfig==2.1.0 --hash=sha256:9deba5723312380e77435581c6bf4935c94cbfab9b1ed33ef8d238ea168eb760
+          packaging==25.0 --hash=sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484
+          pytest-asyncio==0.26.0 --hash=sha256:7b51ed894f4fbea1340262bdae5135797ebbe21d8638978e35d31c6d19f72fb0
+          REQ
+          pip install --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
+            --require-hashes --no-compile --target "$TOOLS" -r "$RUNNER_TEMP/tools-requirements.txt"
+          # Trusted helpers, written by the workflow: a bootstrap that orders sys.path as
+          # standard library, tools, site-packages, checkout; a plugin that checks which files
+          # the loaded modules come from; a tree hasher.
+          BOOT="$RUNNER_TEMP/boot"; mkdir -p "$BOOT"
+          cat > "$BOOT/bootstrap.py" <<'PY'
+          import importlib.machinery, os, sys
+          tools, site, checkout, mode, *rest = sys.argv[1:]
+          sys.verify_paths = (os.path.dirname(os.__file__), tools, site, checkout)
+          # No standard-library name may be found in tools, site-packages or the checkout
+          # (the standard library's own test package is not imported by pytest).
+          shadow = sorted(
+              name for name in sys.stdlib_module_names
+              if name != "test" and importlib.machinery.PathFinder.find_spec(name, [tools, site, checkout])
+          )
+          if shadow:
+              raise SystemExit("standard library names found outside the standard library: " + " ".join(shadow))
+          sys.path.extend([tools, site, checkout])
+          if mode == "pytest":
+              import pytest
+              sys.argv = ["pytest", *rest]
+              raise SystemExit(pytest.main(rest))
+          path, *args = rest
+          sys.argv = [path, *args]
+          exec(compile(open(path).read(), path, "exec"), {"__name__": "__main__"})
+          PY
+          cat > "$TOOLS/verify_guard.py" <<'PY'
+          import os, sys
+          import pytest
+
+
+          def _outside():
+              std, tools, site, checkout = (os.path.realpath(p) for p in sys.verify_paths)
+              roots = (std, tools, site, checkout)
+              bad = []
+              for name, mod in list(sys.modules.items()):
+                  path = getattr(mod, "__file__", None)
+                  if not path or name in ("__main__", "__mp_main__"):
+                      continue  # the bootstrap itself
+                  real = os.path.realpath(path)
+                  if not any(real == r or real.startswith(r + os.sep) for r in roots):
+                      bad.append(f"{name} -> {real}")
+                  elif name.split(".")[0] in sys.stdlib_module_names and not (
+                      real == std or real.startswith(std + os.sep)
+                  ):
+                      bad.append(f"{name} (standard library name) -> {real}")
+              return bad
+
+
+          def pytest_collection_finish(session):
+              bad = _outside()
+              if bad:
+                  raise pytest.UsageError("modules outside the allowed paths: " + "; ".join(bad))
+
+
+          def pytest_sessionfinish(session, exitstatus):
+              if _outside():
+                  session.exitstatus = pytest.ExitCode.INTERNAL_ERROR
+          PY
+          cat > "$BOOT/treehash.py" <<'PY'
+          import hashlib, os, sys
+          root = sys.argv[1]
+          h = hashlib.sha256()
+          for base, dirs, files in os.walk(root):
+              dirs.sort()
+              for name in sorted(files):
+                  path = os.path.join(base, name)
+                  rel = os.path.relpath(path, root)
+                  if os.path.islink(path):
+                      h.update(f"link {rel} {os.readlink(path)}\n".encode())
+                  else:
+                      h.update(f"file {rel} {hashlib.sha256(open(path, 'rb').read()).hexdigest()}\n".encode())
+          print(h.hexdigest())
+          PY
+          bytecode=$(/usr/bin/find "$TOOLS" \( -name __pycache__ -o -name '*.pyc' \) -print)
+          [[ -z "$bytecode" ]] || { echo "bytecode in the tools: $bytecode"; exit 1; }
+          "$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS" > "$RUNNER_TEMP/tools-digest.txt"
+          [[ "$(cat "$RUNNER_TEMP/tools-digest.txt")" == "$VERIFY_TOOLS_DIGEST" ]] \
+            || { echo "the pinned tool set changed: computed $(cat "$RUNNER_TEMP/tools-digest.txt"), expected $VERIFY_TOOLS_DIGEST"; exit 1; }
+          # Requirements with hashes, from the commit's poetry.lock only; every field is
+          # validated before it is written, so the file can hold nothing but requirement lines.
+          "$PYBIN" -I -B - "$CHECKOUT/poetry.lock" "$RUNNER_TEMP/lock-requirements.txt" "$TOOLS" <<'PY'
+          import re, sys, tomllib
+          sys.path.insert(0, sys.argv[3])
+          from packaging.markers import Marker
+          from packaging.version import Version
+          lock = tomllib.load(open(sys.argv[1], "rb"))
+          name_re = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?")
+          version_re = re.compile(r"[0-9A-Za-z.!+_-]+")
+          hash_re = re.compile(r"sha256:[0-9a-f]{64}")
+          lines = []
+          for p in lock["package"]:
+              if p.get("optional"):
+                  continue
+              name, version = p["name"], p["version"]
+              if "source" in p:
+                  raise SystemExit(f"package {name} has a source entry")
+              if not name_re.fullmatch(name):
+                  raise SystemExit(f"bad package name: {name!r}")
+              if not version_re.fullmatch(version):
+                  raise SystemExit(f"bad version for {name}: {version!r}")
+              Version(version)
+              hashes = sorted({f["hash"] for f in p["files"]})
+              if not hashes or not all(hash_re.fullmatch(h) for h in hashes):
+                  raise SystemExit(f"bad or missing hashes for {name}")
+              line = f"{name}=={version}"
+              markers = p.get("markers")
+              if isinstance(markers, str):
+                  if "\n" in markers or "\r" in markers:
+                      raise SystemExit(f"newline in the markers of {name}")
+                  line += f" ; {Marker(markers)}"
+              lines.append(line + "".join(f" --hash={h}" for h in hashes))
+          open(sys.argv[2], "w").write("\n".join(lines) + "\n")
+          PY
+          pip install --index-url https://pypi.org/simple --no-deps --only-binary=:all: \
+            --require-hashes -r "$RUNNER_TEMP/lock-requirements.txt"
+          # Nothing from $VENV/bin runs after the lock install: the site-packages path is derived,
+          # not queried from the venv's interpreter.
+          pyver=$("$PYBIN" -I -S -B -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          test -d "$VENV/lib/python$pyver/site-packages"
+          echo "$VENV/lib/python$pyver/site-packages" > "$RUNNER_TEMP/site-path.txt"
+      - name: Collect, run the protected test set and record the raw outputs
+        env:
+          PYBIN: ${{ steps.py.outputs.python-path }}
+        run: |
+          set -u +e -o pipefail
+          GIT=/usr/bin/git
+          RAW="$RUNNER_TEMP/raw"; mkdir -p "$RAW"
+          VENV="$RUNNER_TEMP/venv"; TOOLS="$RUNNER_TEMP/tools"
+          SITE=$(cat "$RUNNER_TEMP/site-path.txt")
+          BOOT="$RUNNER_TEMP/boot"
+          # Every interpreter start below is -S, so no .pth in site-packages ever loads. A
+          # .pth in the checkout root, and any sitecustomize or usercustomize anywhere, fail.
+          stray=$(/usr/bin/find "$SITE" "$TOOLS" "$PWD" -maxdepth 1 \( -name 'sitecustomize*' -o -name 'usercustomize*' \) -print; /usr/bin/find "$PWD" -maxdepth 1 -name '*.pth' -print)
+          [[ -z "$stray" ]] || { echo "stray startup file(s): $stray"; exit 1; }
+          # The tools must hold no bytecode and must hash to what was recorded after the install.
+          tools_ok() {
+            local stray
+            stray=$(/usr/bin/find "$TOOLS" \( -name __pycache__ -o -name '*.pyc' \) -print)
+            [[ -z "$stray" ]] || { echo "bytecode in the tools $1: $stray"; return 1; }
+            [[ "$("$PYBIN" -I -S -B "$BOOT/treehash.py" "$TOOLS")" == "$(cat "$RUNNER_TEMP/tools-digest.txt")" ]] || { echo "the tools changed $1"; return 1; }
+          }
+          tools_ok "before collection" || exit 1
+          # The runner's own interpreter is started with -I -S -B from an empty environment,
+          # by a fixed bootstrap: the path is the standard library, then tools, then
+          # site-packages, then the checkout. Nothing from $VENV/bin is ever executed.
+          vpy() {
+            # a fresh, never reused bytecode prefix for every call, so nothing earlier can pre-fill it
+            local pycache
+            pycache=$(/usr/bin/mktemp -d "$RUNNER_TEMP/pycache.XXXXXX")
+            /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" LANG=C.UTF-8 TZ=UTC \
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+              "$PYBIN" -I -S -B -X pycache_prefix="$pycache" "$BOOT/bootstrap.py" "$TOOLS" "$SITE" "$PWD" "$@"
+          }
+          survivors() {
+            sleep 2
+            /bin/ps -eo pid=,ppid=,comm= > "$RUNNER_TEMP/ps-now.txt"
+            /usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top && !($2==1 && $3=="systemd-timedat") {print $1" "$3}' \
+              "$RUNNER_TEMP/pids-before.txt" "$RUNNER_TEMP/ps-now.txt"
+          }
+          # pytest and every plugin must resolve inside the pinned tools, never the checkout,
+          # and no sitecustomize or usercustomize may resolve anywhere.
+          cat > "$BOOT/origins.py" <<'PY'
+          import importlib.util, json, os, sys
+          tools, checkout, *plugins = sys.argv[1:]
+          tools, checkout = os.path.realpath(tools), os.path.realpath(checkout)
+          origins = {}
+          for name in ["pytest", "_pytest", "pluggy", "iniconfig", "packaging", *plugins]:
+              spec = importlib.util.find_spec(name)
+              if spec is None or not spec.origin:
+                  raise SystemExit(f"{name} not found")
+              origin = os.path.realpath(spec.origin)
+              if not origin.startswith(tools + os.sep) or origin.startswith(checkout + os.sep):
+                  raise SystemExit(f"{name} resolves to {origin}")
+              origins[name] = origin
+          for name in ("sitecustomize", "usercustomize"):
+              if importlib.util.find_spec(name) is not None:
+                  raise SystemExit(f"{name} is importable")
+          print(json.dumps(origins, indent=2, sort_keys=True))
+          PY
+          vpy script "$BOOT/origins.py" "$TOOLS" "$PWD" $PLUGINS > "$RAW/module-origins.json" || { echo "a pytest module resolves outside the pinned tools"; exit 1; }
+          printf '[pytest]\n' > "$RUNNER_TEMP/verify-pytest.ini"
+          opts=(-c "$RUNNER_TEMP/verify-pytest.ini" --rootdir "$PWD" --confcutdir "$PWD" -o addopts= \
+                -p no:cacheprovider --import-mode=importlib -o junit_family=xunit2 -p verify_guard)
+          for mod in $PLUGINS; do opts+=(-p "$mod" -o asyncio_mode=auto); done
+          read -ra tokens <<< "$TEST_SET"
+          printf '%s\n' $PLUGINS > "$RAW/plugins.txt"
+          vpy pytest --collect-only -q "${opts[@]}" -- "${tokens[@]}" > "$RAW/collect.out" 2>&1
+          echo "$?" > "$RAW/collect-exit-code.txt"
+          /usr/bin/awk 'NF==0{exit} {print}' "$RAW/collect.out" | grep -F '::' > "$RAW/collected.txt" || : > "$RAW/collected.txt"
+          s=$(survivors); [[ -z "$s" ]] || { echo "a process started by the collection is still running: $s"; exit 1; }
+          # --deselect matches by prefix, so every quarantine id must be an exact collected id
+          # and no other collected id may contain it.
+          deselect=()
+          for id in $QUARANTINE; do
+            grep -Fxq -- "$id" "$RAW/collected.txt" || { echo "quarantine id is not a collected test: $id"; exit 1; }
+            [[ "$(grep -c -F -- "$id" "$RAW/collected.txt")" -eq 1 ]] || { echo "quarantine id is a prefix of another test: $id"; exit 1; }
+            deselect+=(--deselect "$id")
+          done
+          printf '%s\n' $QUARANTINE > "$RAW/quarantine.txt"
+          tools_ok "before the run" || exit 1
+          vpy pytest -q "${opts[@]}" "${deselect[@]}" --junitxml="$RAW/junit.xml" -- "${tokens[@]}"
+          echo "$?" > "$RAW/pytest-exit-code.txt"
+          tools_ok "during the run" || exit 1
+          cp "$RUNNER_TEMP/tools-digest.txt" "$RAW/tools-digest.txt"
+          s=$(survivors); [[ -z "$s" ]] || { echo "a process started by the test run is still running: $s"; exit 1; }
+          # Advisory only: the same code that ran the tests could have changed this answer.
+          "$GIT" status --porcelain --untracked-files=all > "$RUNNER_TEMP/status.txt"
+          "$GIT" diff --quiet; diff_rc=$?
+          sed 's/^/worktree not clean: /' "$RUNNER_TEMP/status.txt" | head -20
+          if [[ "$diff_rc" -eq 0 && ! -s "$RUNNER_TEMP/status.txt" ]]; then echo true; else echo false; fi > "$RAW/worktree-clean.txt"
+          # The manifest is written by the runner's own python from the installed
+          # distributions' metadata; the venv's python is not started.
+          cd "$RUNNER_TEMP"
+          "$PYBIN" -I -B - "$RAW/environment.json" "$SITE" <<'PY'
+          import hashlib, importlib.metadata, json, os, platform, sys
+          packages = sorted(f"{d.metadata['Name']}=={d.version}"
+                            for d in importlib.metadata.distributions(path=[sys.argv[2]]))
+          json.dump({
+              "runner_image": (os.environ.get("ImageOS", "") + " " + os.environ.get("ImageVersion", "")).strip(),
+              "os": platform.platform(),
+              "python": platform.python_version(),
+              "packages": packages,
+              "packages_sha256": hashlib.sha256("\n".join(packages).encode()).hexdigest(),
+              "services": "not recorded: service versions and seeded data are deferred until a target needs services",
+          }, open(sys.argv[1], "w"), indent=2, sort_keys=True)
+          PY
+          exit 0
+      - name: Final check that no process of the build or the run is still alive
+        run: |
+          set -euo pipefail
+          /bin/sleep 2
+          /bin/ps -eo pid=,ppid=,comm= > "$RUNNER_TEMP/ps-final.txt"
+          s=$(/usr/bin/awk -v me=$BASHPID -v top=$$ 'NR==FNR{b[$1]=1;next} !($1 in b) && $1!=me && $2!=me && $1!=top && $2!=top && !($2==1 && $3=="systemd-timedat") {print $1" "$3}' "$RUNNER_TEMP/pids-before.txt" "$RUNNER_TEMP/ps-final.txt")
+          [[ -z "$s" ]] || { echo "a process is still running before the upload: $s"; exit 1; }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: raw-${{ inputs.commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/raw
+          if-no-files-found: error
+  attest:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      COMMIT: ${{ inputs.commit }}
+      TEST_SET: ${{ inputs.test-set }}
+      QUARANTINE: ${{ inputs.quarantine }}
+      PLUGINS: ${{ inputs.plugins }}
+      CALLER_REPOSITORY: ${{ github.repository }}
+      CALLER_SHA: ${{ github.sha }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
+      EVENT_NAME: ${{ github.event_name }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Validate the inputs
+        run: |
+          set -euo pipefail
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "commit must be 40 lowercase hex characters"; exit 1; }
+          [[ -n "${TEST_SET// /}" ]] || { echo "test-set is empty"; exit 1; }
+          for tok in $TEST_SET; do
+            [[ "$tok" =~ ^[A-Za-z0-9._/-]+$ && "$tok" != -* && "$tok" != /* && "/$tok/" != */../* ]] \
+              || { echo "test-set token is not a plain relative path: $tok"; exit 1; }
+          done
+          for id in $QUARANTINE; do
+            [[ "$id" == *::* && "$id" != -* ]] || { echo "quarantine id needs :: : $id"; exit 1; }
+          done
+          for mod in $PLUGINS; do
+            [[ "$mod" == pytest_asyncio ]] || { echo "plugin not allowed: $mod"; exit 1; }
+          done
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: raw-${{ inputs.commit }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/raw
+      - name: Build the evidence bundle from git objects and the raw outputs
+        run: |
+          set -euo pipefail
+          mkdir -p evidence-out
+          /usr/bin/python3 -I - <<'PY'
+          import collections, hashlib, json, os, re, subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          commit = os.environ["COMMIT"]
+          raw = Path(os.environ["RUNNER_TEMP"]) / "raw"
+          out = Path("evidence-out")
+          if (raw / "junit.xml").stat().st_size > 20_000_000:
+              raise SystemExit("junit.xml is too large")
+
+          def git(*args):
+              return subprocess.run(["/usr/bin/git", *args], capture_output=True, check=True).stdout
+
+          if git("rev-parse", "HEAD").decode().strip() != commit:
+              raise SystemExit("checkout is not the requested commit")
+          entries = {}
+          for rec in git("ls-tree", "-r", "-z", commit).split(b"\0"):
+              if rec:
+                  meta, path = rec.split(b"\t", 1)
+                  mode, _kind, sha = meta.decode().split(" ")
+                  entries[path.decode()] = (mode, sha)
+
+          def blob_sha256(path):
+              mode, sha = entries[path]
+              if mode not in ("100644", "100755"):
+                  raise SystemExit(f"unsupported entry: {path}")
+              return hashlib.sha256(git("cat-file", "blob", sha)).hexdigest()
+
+          # Test-set digest inputs: every tracked blob under a test-set path, plus the
+          # conftest.py files at the root and in or above those paths, plus the plugins.
+          tokens = os.environ["TEST_SET"].split()
+          chosen = set()
+          for tok in tokens:
+              tok = tok.strip("/")
+              chosen |= {p for p in entries if p == tok or p.startswith(tok + "/")}
+          dirs = {""}
+          for tok in tokens:
+              parts = tok.strip("/").split("/")
+              dirs |= {"/".join(parts[:i]) for i in range(1, len(parts))}
+          for d in dirs:
+              conf = (d + "/" if d else "") + "conftest.py"
+              if conf in entries:
+                  chosen.add(conf)
+          if not chosen:
+              raise SystemExit("test-set matches no tracked file")
+          plugins = sorted(os.environ["PLUGINS"].split())
+          lines = [f"{blob_sha256(p)}  {p}\n" for p in sorted(chosen, key=lambda s: s.encode())]
+          lines += [f"plugin:{name}\n" for name in plugins]
+          inputs_text = "".join(lines)
+          if any("\n" in p for p in chosen):
+              raise SystemExit("newline in a path")
+          (out / "digest-inputs.txt").write_text(inputs_text)
+          digest = hashlib.sha256(inputs_text.encode()).hexdigest()
+
+          dep_text = "".join(f"{blob_sha256(p)}  {p}\n" for p in ("poetry.lock", "pyproject.toml"))
+          dependencies_digest = hashlib.sha256(dep_text.encode()).hexdigest()
+
+          collected = [c for c in (raw / "collected.txt").read_text().split("\n") if c]
+          quarantine = [q for q in (raw / "quarantine.txt").read_text().split("\n") if q]
+          if set(quarantine) != set(os.environ["QUARANTINE"].split()) or \
+                  not set(quarantine) <= set(collected):
+              raise SystemExit("quarantine does not match the collected tests")
+          if len(set(collected)) != len(collected):
+              raise SystemExit("collected ids are not unique")
+          if sorted(p for p in (raw / "plugins.txt").read_text().split("\n") if p) != plugins:
+              raise SystemExit("plugins do not match")
+          collected_digest = hashlib.sha256(
+              "".join(c + "\n" for c in sorted(collected)).encode()).hexdigest()
+
+          def junit_key(node_id):
+              base, bracket, params = node_id.partition("[")
+              names = base.split("::")
+              mod = names[0]
+              if not mod.endswith(".py"):
+                  raise SystemExit(f"unexpected node id: {node_id}")
+              classname = ".".join([mod[:-3].replace("/", "."), *names[1:-1]])
+              return (classname, names[-1] + bracket + params)
+
+          expected = collections.Counter(junit_key(c) for c in collected if c not in set(quarantine))
+          root = ET.parse(raw / "junit.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          declared = collections.Counter()
+          for s in suites:
+              for attr in ("tests", "failures", "errors", "skipped"):
+                  value = s.get(attr, "0")
+                  if not re.fullmatch(r"[0-9]+", value):
+                      raise SystemExit(f"bad {attr} attribute: {value!r}")
+                  declared[attr] += int(value)
+          ran = collections.Counter()
+          failures = errors = skipped = 0
+          for case in root.iter("testcase"):
+              ran[(case.get("classname", ""), case.get("name", ""))] += 1
+              failures += case.find("failure") is not None
+              errors += case.find("error") is not None
+              skipped += case.find("skipped") is not None
+          total = sum(ran.values())
+          consistent = (declared["tests"], declared["failures"], declared["errors"],
+                        declared["skipped"]) == (total, failures, errors, skipped)
+          exit_code = int((raw / "pytest-exit-code.txt").read_text())
+          collect_exit = int((raw / "collect-exit-code.txt").read_text())
+          result = "pass" if (exit_code == 0 and collect_exit == 0 and total > 0 and consistent
+                              and failures + errors == 0 and skipped == 0
+                              and ran == expected) else "fail"
+          report = {
+              "result": result, "tests": total, "failures": failures, "errors": errors,
+              "skipped": skipped, "pytest_exit_code": exit_code,
+              "collect_exit_code": collect_exit, "collected": len(collected),
+              "deselected": len(quarantine), "ids_match_collected": ran == expected,
+              "junit_attributes_consistent": consistent,
+          }
+          tools_digest = (raw / "tools-digest.txt").read_text().strip()
+          if not re.fullmatch(r"[0-9a-f]{64}", tools_digest):
+              raise SystemExit("bad tools digest")
+          if tools_digest != os.environ["VERIFY_TOOLS_DIGEST"]:
+              raise SystemExit("the tools digest differs from the pinned constant")
+          env = json.loads((raw / "environment.json").read_text())
+          (out / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True))
+          (out / "environment.json").write_text(json.dumps(env, indent=2, sort_keys=True))
+          (out / "junit.xml").write_bytes((raw / "junit.xml").read_bytes())
+          (out / "collected.txt").write_text("".join(c + "\n" for c in collected))
+          names = ("report.json", "environment.json", "junit.xml", "collected.txt",
+                   "digest-inputs.txt")
+          (out / "binding.json").write_text(json.dumps({
+              "repository": os.environ["CALLER_REPOSITORY"],
+              "commit": commit,
+              "caller_sha": os.environ["CALLER_SHA"],
+              "workflow_ref": os.environ["WORKFLOW_REF"],
+              "event_name": os.environ["EVENT_NAME"],
+              "run_id": os.environ["RUN_ID"],
+              "run_attempt": os.environ["RUN_ATTEMPT"],
+              "test_set": tokens,
+              "test_set_digest": digest,
+              "dependencies_digest": dependencies_digest,
+              "tools_digest": tools_digest,
+              "collected_digest": collected_digest,
+              "quarantine": quarantine,
+              "plugins": plugins,
+              "python": os.environ["VERIFY_PYTHON"],
+              "pytest": os.environ["VERIFY_PYTEST"],
+              "pytest_asyncio": os.environ["VERIFY_PYTEST_ASYNCIO"],
+              "worktree_clean_advisory": (raw / "worktree-clean.txt").read_text().strip() == "true",
+              "result": result,
+              "artifacts": {n: hashlib.sha256((out / n).read_bytes()).hexdigest() for n in names},
+          }, indent=2, sort_keys=True))
+          PY
+          tar -czf evidence.tgz -C evidence-out binding.json report.json environment.json junit.xml collected.txt digest-inputs.txt
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: evidence.tgz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: evidence-${{ inputs.commit }}-${{ github.run_attempt }}
+          path: evidence.tgz
+          if-no-files-found: error
+      - name: Fail unless the protected test set passed
+        run: |
+          /usr/bin/python3 -I -c 'import json,sys; r=json.load(open("evidence-out/report.json")); print(r); sys.exit(0 if r["result"]=="pass" else 1)'
