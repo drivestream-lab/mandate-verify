@@ -46,6 +46,7 @@ jobs:
       QUARANTINE: ${{ inputs.quarantine }}
       PLUGINS: ${{ inputs.plugins }}
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Validate the inputs
         run: |
