@@ -82,13 +82,14 @@ jobs:
         run: make setup
       - name: Collect, run the protected test set and record the raw outputs
         run: |
-          set -uo pipefail
+          set -u +e -o pipefail
           RAW="$RUNNER_TEMP/raw"; mkdir -p "$RAW"
           cfg="$RUNNER_TEMP/verify-pytest.ini"
-          printf '[pytest]\npythonpath = .\nasyncio_mode = auto\n' > "$cfg"
+          printf '[pytest]\npythonpath = .\n' > "$cfg"
           read -ra tokens <<< "$TEST_SET"
           opts=(-c "$cfg" --rootdir "$PWD" -o addopts= -p no:cacheprovider)
           for mod in $PLUGINS; do opts+=(-p "$mod"); done
+          [[ " $PLUGINS " == *" pytest_asyncio "* ]] && opts+=(-o asyncio_mode=auto)
           .venv/bin/python -m pytest --collect-only -q "${opts[@]}" -- "${tokens[@]}" > "$RAW/collect.out" 2>&1
           echo "$?" > "$RAW/collect-exit-code.txt"
           grep -F '::' "$RAW/collect.out" | grep -v '^ ' > "$RAW/collected.txt" || : > "$RAW/collected.txt"
@@ -104,7 +105,7 @@ jobs:
           .venv/bin/python -m pytest -q "${opts[@]}" "${deselect[@]}" --junitxml="$RAW/junit.xml" -- "${tokens[@]}"
           echo "$?" > "$RAW/pytest-exit-code.txt"
           git diff --exit-code > /dev/null 2>&1; diff_rc=$?
-          untracked=$(git status --porcelain --untracked-files=all | wc -l)
+          untracked=$(git status --porcelain --untracked-files=all -- . ':(exclude).venv' | wc -l)
           if [[ "$diff_rc" -eq 0 && "$untracked" -eq 0 ]]; then echo true; else echo false; fi > "$RAW/worktree-clean.txt"
           python3 -I - "$RAW/environment.json" <<'PY'
           import hashlib, json, os, platform, subprocess, sys
